@@ -1,0 +1,8 @@
+[package]
+name = "mrs-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["sbchild <sbchild0@gmail.com>"]
+
+[dependencies]
