@@ -10,6 +10,7 @@ use std::error::Error;
 use std::ffi::c_void;
 
 pub mod android_lib_args;
+pub mod android_lib_embed;
 pub mod android_lib_func;
 pub mod android_log;
 pub mod android_opts;

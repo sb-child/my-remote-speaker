@@ -25,4 +25,4 @@ members = ["mrs-speaker", "mrs-client"]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"

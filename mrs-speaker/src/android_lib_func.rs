@@ -14,7 +14,9 @@ use cpal::traits::HostTrait as _;
 use jni::{
     EnvUnowned,
     errors::ThrowRuntimeExAndDefault,
+    jni_str,
     objects::{JClass, JObject, JString},
+    strings::JNIString,
 };
 #[cfg(feature = "android")]
 use std::{error::Error, ffi::c_void};
@@ -66,18 +68,42 @@ pub unsafe extern "C" fn entrypoint(
     unsafe { ndk_context::initialize_android_context(vm_ptr, activity_ptr) };
     let conf_string = json_config.to_string();
     if !conf_string.starts_with("{") {
-        eprintln!("Failed to get config: {conf_string}");
+        let err_msg = format!("Failed to get config: {conf_string}");
+        eprintln!("{err_msg}");
+        let _ = maybe_env
+            .with_env(|env| {
+                let err_msg = JNIString::new(err_msg);
+                env.throw_new(jni_str!("java/lang/IllegalArgumentException"), err_msg)?;
+                Ok::<_, jni::errors::Error>(())
+            })
+            .resolve::<ThrowRuntimeExAndDefault>();
         return;
     }
     let conf: android_lib_args::LibLaunchArgs = match serde_json::from_str(&conf_string) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to parse config: {e}. String is {conf_string}");
+            let err_msg = format!("Failed to parse config: {e}. String is {conf_string}");
+            eprintln!("{err_msg}");
+            let _ = maybe_env
+                .with_env(|env| {
+                    let err_msg = JNIString::new(err_msg);
+                    env.throw_new(jni_str!("java/lang/IllegalArgumentException"), err_msg)?;
+                    Ok::<_, jni::errors::Error>(())
+                })
+                .resolve::<ThrowRuntimeExAndDefault>();
             return;
         }
     };
     if let Err(err) = lib_main(conf) {
-        eprintln!("lib_main error: {:#?}({})", err, err);
+        let err_msg = format!("lib_main error: {:#?}({})", err, err);
+        eprintln!("{err_msg}");
+        let _ = maybe_env
+            .with_env(|env| {
+                let err_msg = JNIString::new(err_msg);
+                env.throw_new(jni_str!("java/lang/RuntimeException"), err_msg)?;
+                Ok::<_, jni::errors::Error>(())
+            })
+            .resolve::<ThrowRuntimeExAndDefault>();
         return;
     }
 }

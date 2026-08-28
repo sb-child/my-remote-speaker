@@ -1,6 +1,7 @@
 use clap::Parser as _;
 use mrs_speaker::{
     android_lib_args::{LaunchMode, LibLaunchArgs},
+    android_lib_embed::get_embedded_payload,
     android_log::{LogMode, init_tracing},
     android_opts::{Cli, Commands, DaemonArgs, MagiskCommonArgs},
     magisk_println,
@@ -88,5 +89,11 @@ fn on_magisk_action(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     let kps = rmt::keypair::KeypairService::new(&conf_path)?;
     let pubkey_bytes = kps.read_public_key()?;
     magisk_println!("Public key: [{}]", key_encode(&pubkey_bytes));
+    Ok(())
+}
+
+fn extract_embed_files() -> Result<(), Box<dyn Error>> {
+    let data = get_embedded_payload()?;
+    // todo
     Ok(())
 }

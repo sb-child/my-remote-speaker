@@ -1,12 +1,78 @@
+import base64
+import json
 import re
 import shlex
+import shutil
 import subprocess
 import os
-from dataclasses import dataclass
+import struct
+import hashlib
 from pathlib import Path
 from packaging.version import Version
 
+
 script_dir = Path(__file__).parent.resolve()
+
+build_android_binary_dest_dir = (
+    script_dir / "build" / "mrs-speaker-android-bin"
+).resolve()
+build_android_library_dest_dir = (
+    script_dir / "build" / "mrs-speaker-android-lib"
+).resolve()
+build_android_entrypoint_jar_dest_dir = (
+    script_dir / "build" / "mrs-speaker-android-jar"
+).resolve()
+build_android_magisk_dest_dir = (
+    script_dir / "build" / "mrs-speaker-android-magisk"
+).resolve()
+build_temp = (script_dir / "build" / "temp").resolve()
+
+
+def init_build_dir():
+    for d in [
+        build_android_binary_dest_dir,
+        build_android_library_dest_dir,
+        build_android_entrypoint_jar_dest_dir,
+        build_android_magisk_dest_dir,
+        build_temp,
+    ]:
+        d.mkdir(exist_ok=True, parents=True)
+    for i in build_temp.iterdir():
+        if i.is_dir() and not i.is_symlink():
+            shutil.rmtree(i)
+        else:
+            i.unlink()
+    print("Build dir created.")
+
+
+EMBED_MAGIC = b"MRS-Data"
+EMBED_LEN_FMT = "<Q"
+EMBED_TRAILER_LEN = struct.calcsize(EMBED_LEN_FMT) + len(EMBED_MAGIC)
+
+
+def split_bin(exe: Path):
+    with open(exe, "rb") as f:
+        d = f.read()
+    if len(d) >= EMBED_TRAILER_LEN and d[-len(EMBED_MAGIC) :] == EMBED_MAGIC:
+        n = struct.unpack(EMBED_LEN_FMT, d[-EMBED_TRAILER_LEN : -len(EMBED_MAGIC)])[0]
+        if n + EMBED_TRAILER_LEN <= len(d):
+            return d[: len(d) - EMBED_TRAILER_LEN - n], d[
+                len(d) - EMBED_TRAILER_LEN - n : len(d) - EMBED_TRAILER_LEN
+            ]
+    return d, b""
+
+
+def embed_bin(exe: Path, payload: bytes):
+    base, split = split_bin(exe)
+    print(
+        f"base {len(base)} bytes, split {len(split)} bytes, replace {len(payload)} bytes"
+    )
+    with open(exe, "wb") as f:
+        f.write(base)
+        if payload:
+            f.write(payload)
+            f.write(struct.pack(EMBED_LEN_FMT, len(payload)))
+            f.write(EMBED_MAGIC)
 
 
 def _ensure_cargo_update_installed() -> bool:
@@ -90,11 +156,6 @@ def rustup_target_install(target_name: str):
     return True
 
 
-@dataclass
-class BuildAndroidBinaryOptions:
-    pass
-
-
 def get_ndk_env(target: str) -> dict[str, str]:
     cmd = ["cargo", "ndk-env", "--target", target]
     try:
@@ -142,19 +203,25 @@ def get_android_ndk_home(target: str) -> str:
 
 def build_android_java_entrypoint():
     platform = "35"
-    java_version = "1.8"
+    java_version = "8"
     build_tools_version = f"{platform}.0.0"
     env = os.environ.copy()
     android_home = env.get("ANDROID_HOME")
     if android_home is None:
-        print("Failed to find ANDROID_HOME.")
-        return False
+        raise FileNotFoundError("Failed to find ANDROID_HOME.")
     bootclass = Path(android_home) / "platforms" / f"android-{platform}" / "android.jar"
     code_dir = script_dir / "java-entrypoint"
     main_file = code_dir / "Main.java"
     output_dir = code_dir / "out"
     output_dir.mkdir(exist_ok=True)
-    cmd_header = ["javac", "-source", java_version, "-target", java_version]
+    cmd_header = [
+        "javac",
+        "-source",
+        java_version,
+        "-target",
+        java_version,
+        "-Xlint:-options",
+    ]
     cmd_bootclass = ["-bootclasspath", str(bootclass.resolve())]
     cmd_files = ["-d", str(output_dir.resolve()), str(main_file.resolve())]
     try:
@@ -164,8 +231,7 @@ def build_android_java_entrypoint():
             env=env,
         )
     except subprocess.CalledProcessError as e:
-        print(f"Failed to build java entrypoint: {e}")
-        return False
+        raise RuntimeError(f"Failed to build java entrypoint: {e}")
     cmd_executable = [
         (Path(android_home) / "build-tools" / build_tools_version / "d8").resolve()
     ]
@@ -183,22 +249,18 @@ def build_android_java_entrypoint():
             env=env,
         )
     except subprocess.CalledProcessError as e:
-        print(f"Failed to convert entrypoint to jar: {e}")
-        return False
+        raise RuntimeError(f"Failed to convert entrypoint to jar: {e}")
     res = (output_dir / "mrs_speaker_dex.jar").resolve()
     if not res.is_file():
-        print(f"{res} file not found.")
-        return False
+        raise FileNotFoundError(f"{res} file not found.")
     return res
 
 
 def build_android_library():
     if not cargo_install("cargo-ndk", "4.1.2"):
-        print("Failed to install cargo-ndk v4.1.2")
-        return False
+        raise RuntimeError("Failed to install cargo-ndk v4.1.2")
     if not rustup_target_install("aarch64-linux-android"):
-        print("Failed to install aarch64-linux-android target.")
-        return False
+        raise RuntimeError("Failed to install aarch64-linux-android target.")
     platform = "35"
     abi = "arm64-v8a"
     env = os.environ.copy() | {
@@ -225,8 +287,7 @@ def build_android_library():
             env=env,
         )
     except subprocess.CalledProcessError as e:
-        print(f"Failed to build mrs-speaker library: {e}")
-        return False
+        raise RuntimeError(f"Failed to build mrs-speaker library: {e}")
     res = (
         script_dir
         / ".."
@@ -236,18 +297,15 @@ def build_android_library():
         / "libmrs_speaker.so"
     ).resolve()
     if not res.is_file():
-        print(f"{res} file not found.")
-        return False
+        raise FileNotFoundError(f"{res} file not found.")
     return res
 
 
 def build_android_binary():
     if not cargo_install("cargo-ndk", "4.1.2"):
-        print("Failed to install cargo-ndk v4.1.2")
-        return False
+        raise RuntimeError("Failed to install cargo-ndk v4.1.2")
     if not rustup_target_install("aarch64-linux-android"):
-        print("Failed to install aarch64-linux-android target.")
-        return False
+        raise RuntimeError("Failed to install aarch64-linux-android target.")
     platform = "35"
     abi = "arm64-v8a"
     env = os.environ.copy() | {
@@ -275,8 +333,7 @@ def build_android_binary():
             env=env,
         )
     except subprocess.CalledProcessError as e:
-        print(f"Failed to build mrs-speaker-android binary: {e}")
-        return False
+        raise RuntimeError(f"Failed to build mrs-speaker-android binary: {e}")
     res = (
         script_dir
         / ".."
@@ -286,14 +343,39 @@ def build_android_binary():
         / "mrs-speaker-android"
     ).resolve()
     if not res.is_file():
-        print(f"{res} file not found.")
-        return False
+        raise FileNotFoundError(f"{res} file not found.")
     return res
 
 
 def main():
-    build_android_java_entrypoint()
-    # build_android_binary()
+    init_build_dir()
+    ep = build_android_java_entrypoint()
+    lib_file = build_android_library()
+    bin_file = build_android_binary()
+    embed_pack = {}
+    with open(ep, "rb") as f:
+        digest = hashlib.file_digest(f, "sha256")
+        f.seek(0)
+        embed_pack["jar_digest"] = base64.b64encode(digest.digest()).decode()
+        embed_pack["jar_data"] = base64.b64encode(f.read()).decode()
+    with open(lib_file, "rb") as f:
+        digest = hashlib.file_digest(f, "sha256")
+        f.seek(0)
+        embed_pack["lib_digest"] = base64.b64encode(digest.digest()).decode()
+        embed_pack["lib_data"] = base64.b64encode(f.read()).decode()
+    embed_pack_json = json.dumps(embed_pack)
+    del embed_pack
+    bin_temp = build_temp / "mrs-speaker-android.temp"
+    with open(bin_file, "rb") as f:
+        with open(bin_temp, "wb") as t:
+            t.write(f.read())
+    embed_bin(bin_temp, embed_pack_json.encode())
+    del embed_pack_json
+    bin_release = build_android_binary_dest_dir / "mrs-speaker-android"
+    with open(bin_temp, "rb") as f:
+        with open(bin_release, "wb") as t:
+            t.write(f.read())
+    bin_release.chmod(0o755)
 
 
 if __name__ == "__main__":
