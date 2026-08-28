@@ -5,16 +5,16 @@ use std::{
 };
 use tracing::info;
 
-pub struct SampleStoreService {
+pub struct SampleCacheService {
     store_path: PathBuf,
 }
 
 #[derive(Snafu, Debug)]
-pub enum SampleStoreError {
+pub enum SampleCacheError {
     #[snafu(display("Directory not found: {}", fp.display()))]
     DirectoryNotFound { fp: PathBuf },
 
-    #[snafu(display("Failed to load database {}: {}", fp.display(),source))]
+    #[snafu(display("Failed to load database {}: {}", fp.display(), source))]
     LoadDatabase {
         source: surrealkv::Error,
         fp: PathBuf,
@@ -30,52 +30,46 @@ pub enum SampleStoreError {
     StartRuntime { source: std::io::Error },
 }
 
-impl SampleStoreService {
-    pub fn new<P: AsRef<Path>>(conf_base: P) -> Result<Self, SampleStoreError> {
-        let base_path = conf_base.as_ref();
+impl SampleCacheService {
+    pub fn new<P: AsRef<Path>>(temp_base: P) -> Result<Self, SampleCacheError> {
+        let base_path = temp_base.as_ref();
         if !base_path.is_dir() {
-            return Err(SampleStoreError::DirectoryNotFound {
+            return Err(SampleCacheError::DirectoryNotFound {
                 fp: base_path.to_path_buf(),
             });
         }
-        let store_path = base_path.join("sample-store");
-        let r = Self {
-            store_path: store_path,
-        };
-        if r.test_db().is_err() {
-            r.rebuild_db()?;
-        }
+        let store_path = base_path.join("sample-cache");
+        let service = Self { store_path };
+        service.rebuild_db()?;
         info!("Service ready.");
-        Ok(r)
+        Ok(service)
     }
 
     fn db_builder(&self) -> surrealkv::TreeBuilder {
-        surrealkv::TreeBuilder::new()
-            .with_path(self.store_path.clone())
-            .with_enable_vlog(true)
-            .with_vlog_checksum_verification(surrealkv::VLogChecksumLevel::Full)
+        surrealkv::TreeBuilder::new().with_path(self.store_path.clone())
     }
 
-    pub async fn open(&self) -> Result<surrealkv::Tree, SampleStoreError> {
+    pub async fn open(&self) -> Result<surrealkv::Tree, SampleCacheError> {
         let db = self.db_builder().build().context(LoadDatabaseSnafu {
             fp: self.store_path.clone(),
         })?;
-        info!("Database sample-store opened.");
+        info!("Database sample-cache opened.");
         Ok(db)
     }
 
-    fn test_db(&self) -> Result<(), SampleStoreError> {
+    fn test_db(&self) -> Result<(), SampleCacheError> {
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_e) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
-                    .name("samplestore-test-rt")
+                    .name("samplecache-test-rt")
                     .build()
                     .context(StartRuntimeSnafu)?;
                 rt.handle().clone()
             }
         };
-        let r: Result<(), SampleStoreError> = handle.block_on(async {
+
+        handle.block_on(async {
             let db = self.db_builder().build().context(LoadDatabaseSnafu {
                 fp: self.store_path.clone(),
             })?;
@@ -83,21 +77,20 @@ impl SampleStoreService {
                 fp: self.store_path.clone(),
             })?;
             Ok(())
-        });
-        r
+        })
     }
 
-    fn rebuild_db(&self) -> Result<(), SampleStoreError> {
+    fn rebuild_db(&self) -> Result<(), SampleCacheError> {
         if self.store_path.exists() {
             fs::remove_dir_all(&self.store_path).context(RemoveDirSnafu {
                 fp: self.store_path.clone(),
             })?;
         }
-        fs::create_dir_all(self.store_path.clone()).context(CreateDirSnafu {
+        fs::create_dir_all(&self.store_path).context(CreateDirSnafu {
             fp: self.store_path.clone(),
         })?;
         self.test_db()?;
-        info!("New sample-store created.");
+        info!("New sample-cache created.");
         Ok(())
     }
 }

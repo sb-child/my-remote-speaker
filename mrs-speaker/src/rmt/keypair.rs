@@ -7,6 +7,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
 };
+use tracing::info;
 
 #[derive(Snafu, Debug)]
 pub enum KeypairError {
@@ -69,6 +70,7 @@ impl KeypairService {
         if service.load_conf().is_err() {
             service.rotate()?;
         }
+        info!("Service ready.");
         Ok(service)
     }
 
@@ -89,10 +91,10 @@ impl KeypairService {
     pub fn rotate(&self) -> Result<conf::KeypairConf, KeypairError> {
         let new_conf = Self::generate_new_keypair();
         self.save_conf(&new_conf)?;
+        info!("New keypair generated and saved.");
         Ok(new_conf)
     }
 
-    /// 尝试读取配置，读取失败则重新生成
     fn load_or_recover(&self) -> Result<conf::KeypairConf, KeypairError> {
         match self.load_conf() {
             Ok(conf) => Ok(conf),
@@ -121,7 +123,6 @@ impl KeypairService {
         Ok(conf)
     }
 
-    /// 将配置写入文件
     fn save_conf(&self, conf: &conf::KeypairConf) -> Result<(), KeypairError> {
         let json_str = serde_json::to_string_pretty(conf).context(SerializeJsonSnafu)?;
         let mut file = OpenOptions::new()

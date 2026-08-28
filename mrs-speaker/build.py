@@ -1,4 +1,5 @@
 import re
+import shlex
 import subprocess
 import os
 from dataclasses import dataclass
@@ -94,6 +95,51 @@ class BuildAndroidBinaryOptions:
     pass
 
 
+def get_ndk_env(target: str) -> dict[str, str]:
+    cmd = ["cargo", "ndk-env", "--target", target]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        output = result.stdout
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        raise RuntimeError(f"Failed to execute cargo ndk-env: {e}") from e
+    env_vars: dict[str, str] = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or not line.startswith("export "):
+            continue
+        kv_pair = line[len("export ") :].strip()
+        if "=" in kv_pair:
+            key, raw_value = kv_pair.split("=", 1)
+            key = key.strip()
+            try:
+                parsed_tokens = shlex.split(raw_value)
+                value = parsed_tokens[0] if parsed_tokens else ""
+            except ValueError:
+                value = raw_value.strip("\"'")
+            env_vars[key] = value
+    return env_vars
+
+
+def get_android_ndk_home(target: str) -> str:
+    env_vars = get_ndk_env(target)
+    path_candidates = [
+        env_vars.get("CARGO_NDK_SYSROOT_PATH"),
+        env_vars.get("CLANG_PATH"),
+        env_vars.get("CARGO_NDK_SYSROOT_LIBS_PATH"),
+    ]
+    for path_str in path_candidates:
+        if not path_str:
+            continue
+        if "/toolchains/" in path_str:
+            ndk_root = path_str.partition("/toolchains/")[0]
+            return ndk_root.rstrip("/") + "/"
+    for val in env_vars.values():
+        if val and "/toolchains/" in val:
+            ndk_root = val.partition("/toolchains/")[0]
+            return ndk_root.rstrip("/") + "/"
+    raise ValueError(f"Failed to find android ndk home for target '{target}'")
+
+
 def build_android_binary():
     if not cargo_install("cargo-ndk", "4.1.2"):
         print("Failed to install cargo-ndk v4.1.2")
@@ -103,7 +149,10 @@ def build_android_binary():
         return False
     platform = "35"
     abi = "arm64-v8a"
-    env = os.environ.copy()
+    env = os.environ.copy() | {
+        # https://github.com/DoumanAsh/opusic-sys#android-build
+        "ANDROID_NDK_HOME": get_android_ndk_home(abi)
+    }
     try:
         _r = subprocess.run(
             [
