@@ -7,7 +7,14 @@ use mrs_speaker::{
     magisk_println,
     rmt::{self, keypair::key_encode},
 };
-use std::{error::Error, fs};
+use std::{
+    error::Error,
+    fs::{self, Permissions},
+    os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _},
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tracing::{error, info, warn};
 
 fn main() {
@@ -61,9 +68,7 @@ fn run_magisk_daemon(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
         conf_path,
         temp_path,
     };
-    let launch_args_str = serde_json::to_string(&launch_args)?;
-    info!("Extract files...");
-    // todo
+    launch_lib(launch_args)?;
     Ok(())
 }
 
@@ -78,9 +83,7 @@ fn run_daemon(da: DaemonArgs) -> Result<(), Box<dyn Error>> {
         conf_path,
         temp_path,
     };
-    let launch_args_str = serde_json::to_string(&launch_args)?;
-    info!("Extract files...");
-    // todo
+    launch_lib(launch_args)?;
     Ok(())
 }
 
@@ -92,8 +95,55 @@ fn on_magisk_action(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn extract_embed_files() -> Result<(), Box<dyn Error>> {
+fn launch_lib(launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            if self.path.exists() {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+    let launch_args_str = serde_json::to_string(&launch_args)?;
+    info!("Extracting payload...");
     let data = get_embedded_payload()?;
-    // todo
-    Ok(())
+    let base_tmp = Path::new("/data/local/tmp");
+    if !base_tmp.exists() {
+        warn!(
+            "{} not exist. Trying to create this directory.",
+            base_tmp.display()
+        );
+        fs::create_dir_all(base_tmp)?;
+    }
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let random_dir_name = format!("mrs_{}_{}", std::process::id(), timestamp);
+    let temp_dir_path = base_tmp.join(random_dir_name);
+    fs::create_dir_all(&temp_dir_path)?;
+    let _guard = TempDirGuard {
+        path: temp_dir_path.clone(),
+    };
+    info!("Extracting files to {}", temp_dir_path.display());
+    let jar_path = temp_dir_path.join("mrs_speaker_dex.jar");
+    let lib_path = temp_dir_path.join("libmrs_speaker.so");
+    fs::write(&jar_path, &data.jar_data)?;
+    fs::write(&lib_path, &data.lib_data)?;
+    let permissions = Permissions::from_mode(0o755);
+    fs::set_permissions(&jar_path, permissions.clone())?;
+    fs::set_permissions(&lib_path, permissions)?;
+    info!("Launch app_process.");
+    let mut cmd = Command::new("/bin/app_process");
+    cmd.env("CLASSPATH", &jar_path)
+        .env("LD_LIBRARY_PATH", &temp_dir_path);
+    cmd.arg(&temp_dir_path)
+        .arg("com.sbchild.mrs_speaker_android.Main")
+        .arg(&launch_args_str);
+    let status = cmd.status()?;
+    let exit_code = match status.code() {
+        Some(code) => code,
+        None => status.signal().map(|s| 128 + s).unwrap_or(-1),
+    };
+    info!("app_process returned exit code {exit_code}.");
+    Ok(exit_code)
 }
