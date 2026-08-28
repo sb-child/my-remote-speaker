@@ -8,7 +8,7 @@ use crate::{
         sample_store::SampleStoreService,
     },
 };
-use cpal::traits::HostTrait as _;
+use cpal::traits::{DeviceTrait as _, HostTrait as _};
 #[cfg(feature = "android")]
 use jni::{
     EnvUnowned,
@@ -219,6 +219,8 @@ fn test_audio() {
         Ok(devs) => {
             for d in devs {
                 info!("output_device: {:?}", d);
+                // let desc = d.description().unwrap();
+                // desc.device_type();
             }
         }
         Err(e) => {
