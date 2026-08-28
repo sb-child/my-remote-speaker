@@ -150,9 +150,7 @@ fn launch_lib(mut launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
     })?;
     info!("Launch app_process.");
     let should_stop_path = temp_dir_path.join("should_stop");
-    launch_args
-        .stop_file
-        .replace(std::fs::canonicalize(&should_stop_path)?);
+    launch_args.stop_file.replace(should_stop_path.clone()); // don't canonicalize, file not create yet
     let launch_args_str = serde_json::to_string(&launch_args)?;
     let mut cmd = Command::new("/bin/app_process");
     cmd.env("CLASSPATH", &jar_path)
