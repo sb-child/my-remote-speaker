@@ -9,7 +9,8 @@ use mrs_speaker::{
 };
 use std::{
     error::Error,
-    fs::{self, File, Permissions},
+    fs::{self, File, OpenOptions, Permissions},
+    io::Write,
     os::unix::{
         fs::PermissionsExt as _,
         process::{CommandExt as _, ExitStatusExt as _},
@@ -23,6 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tempfile::{NamedTempFile, TempDir};
 use tracing::{error, info, warn};
 
 fn main() {
@@ -77,7 +79,8 @@ fn run_magisk_daemon(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
         temp_path: std::fs::canonicalize(temp_path)?,
         stop_file: None,
     };
-    launch_lib(launch_args)?;
+    let base_tmp = select_temp_dir_for_launch(mca.temp_path)?;
+    launch_lib(launch_args, &base_tmp)?;
     Ok(())
 }
 
@@ -93,8 +96,53 @@ fn run_daemon(da: DaemonArgs) -> Result<(), Box<dyn Error>> {
         temp_path: std::fs::canonicalize(temp_path)?,
         stop_file: None,
     };
-    launch_lib(launch_args)?;
+    let base_tmp = select_temp_dir_for_launch(da.temp_path)?;
+    launch_lib(launch_args, &base_tmp)?;
     Ok(())
+}
+
+fn select_temp_dir_for_launch(fallback: PathBuf) -> Result<PathBuf, Box<dyn Error>> {
+    let base_tmp = PathBuf::from("/data/local/tmp");
+    let fb = std::fs::canonicalize(fallback)?.join("mrs-bin-temp");
+    let p = match fs::metadata(&base_tmp) {
+        Ok(_md) if has_write_permission_in_dir(&base_tmp) => base_tmp,
+        Ok(_md) => {
+            warn!(
+                "{} is readonly, fallback to {}",
+                base_tmp.display(),
+                fb.display()
+            );
+            fb
+        }
+        Err(e) => {
+            warn!(
+                "{e}: {} is not accessible, fallback to {}",
+                base_tmp.display(),
+                fb.display()
+            );
+            fb
+        }
+    };
+    Ok(p)
+}
+
+fn has_write_permission_in_dir<P: AsRef<Path>>(dir: P) -> bool {
+    let dir = dir.as_ref();
+    if !dir.is_dir() {
+        return false;
+    }
+    match NamedTempFile::new_in(dir) {
+        Ok(mut temp_file) => {
+            if temp_file.write_all(&[1, 2, 3, 4]).is_err() {
+                return false;
+            }
+            if temp_file.flush().is_err() {
+                return false;
+            }
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn on_magisk_action(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
@@ -110,20 +158,10 @@ fn on_magisk_uninstall(_mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn launch_lib(mut launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
-    struct TempDirGuard {
-        path: PathBuf,
-    }
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            if self.path.exists() {
-                let _ = fs::remove_dir_all(&self.path);
-            }
-        }
-    }
+fn launch_lib(mut launch_args: LibLaunchArgs, base_tmp: &Path) -> Result<i32, Box<dyn Error>> {
     info!("Extracting payload...");
     let data = get_embedded_payload()?;
-    let base_tmp = Path::new("/data/local/tmp");
+    info!("Payload extracted.");
     if !base_tmp.exists() {
         warn!(
             "{} not exist. Trying to create this directory.",
@@ -131,36 +169,41 @@ fn launch_lib(mut launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
         );
         fs::create_dir_all(base_tmp)?;
     }
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let random_dir_name = format!("mrs_{}_{}", std::process::id(), timestamp);
-    let temp_dir_path = base_tmp.join(random_dir_name);
-    fs::create_dir_all(&temp_dir_path)?;
-    let _guard = TempDirGuard {
-        path: temp_dir_path.clone(),
-    };
-    info!("Extracting files to {}", temp_dir_path.display());
-    let jar_path = temp_dir_path.join("mrs_speaker_dex.jar");
-    let lib_path = temp_dir_path.join("libmrs_speaker.so");
+    let temp_dir = TempDir::new_in(base_tmp)?;
+    info!(
+        "Created {} for extracting files...",
+        temp_dir.path().display()
+    );
+    let jar_path = temp_dir.path().join("mrs_speaker_dex.jar");
+    let lib_path = temp_dir.path().join("libmrs_speaker.so");
     fs::write(&jar_path, &data.jar_data)?;
     fs::write(&lib_path, &data.lib_data)?;
-    let permissions = Permissions::from_mode(0o755);
-    fs::set_permissions(&jar_path, permissions.clone())?;
-    fs::set_permissions(&lib_path, permissions)?;
+    info!("Setting permissions...");
+    let jar_permissions = Permissions::from_mode(0o400); // read-only
+    let lib_permissions = Permissions::from_mode(0o500); // read-only + execute
+    fs::set_permissions(&jar_path, jar_permissions)?;
+    fs::set_permissions(&lib_path, lib_permissions)?;
     info!("Registered signal handler for Ctrl-C.");
     let running = Arc::new(AtomicBool::new(true));
+    let force_stop = Arc::new(AtomicBool::new(false));
     let r = running.clone();
+    let f = force_stop.clone();
     ctrlc::set_handler(move || {
         warn!("Ctrl-C detected.");
-        r.store(false, Ordering::SeqCst);
+        if !r.update(Ordering::SeqCst, Ordering::SeqCst, |_x| false) {
+            warn!("Double Ctrl-C detected, force stop.");
+            f.store(true, Ordering::SeqCst);
+        }
     })?;
     info!("Launch app_process.");
-    let should_stop_path = temp_dir_path.join("should_stop");
+    let should_stop_path = temp_dir.path().join("should_stop");
     launch_args.stop_file.replace(should_stop_path.clone()); // don't canonicalize, file not create yet
     let launch_args_str = serde_json::to_string(&launch_args)?;
-    let mut cmd = Command::new("/bin/app_process");
+    let mut cmd = Command::new("/system/bin/app_process");
     cmd.env("CLASSPATH", &jar_path)
-        .env("LD_LIBRARY_PATH", &temp_dir_path);
-    cmd.arg(&temp_dir_path)
+        .env("LD_LIBRARY_PATH", temp_dir.path())
+        .env("MRS_LIBFILE_PATH", lib_path.to_str().unwrap_or_default());
+    cmd.arg(temp_dir.path())
         .arg("com.sbchild.mrs_speaker_android.Main")
         .arg(&launch_args_str);
     cmd.process_group(0);
@@ -178,9 +221,14 @@ fn launch_lib(mut launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
             let _ = File::create(&should_stop_path);
             stop_time = Some(Instant::now());
         }
+        if force_stop.load(Ordering::SeqCst) {
+            error!("Triggering force stop.");
+            let _ = child.kill();
+            break child.wait()?;
+        }
         if stop_signaled {
             if let Some(start_time) = stop_time {
-                if start_time.elapsed() >= Duration::from_secs(3) {
+                if start_time.elapsed() >= Duration::from_secs(10) {
                     error!("app_process got stuck, force stop.");
                     let _ = child.kill();
                     break child.wait()?;

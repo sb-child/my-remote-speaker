@@ -152,6 +152,5 @@ pub fn get_embedded_payload() -> Result<Payload, EmbedError> {
         .context(SeekSnafu { fp: &fp })?;
     f.read_exact(&mut buf).context(ReadSnafu { fp: &fp })?;
     let payload: Payload = serde_json::from_slice(&buf).context(JsonParseSnafu { fp: &fp })?;
-
     Ok(payload)
 }

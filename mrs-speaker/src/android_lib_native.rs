@@ -20,9 +20,10 @@ use jni::{
 use std::error::Error;
 #[cfg(feature = "android")]
 use std::ffi::c_void;
+use std::time::Duration;
 use std::{fs, path::PathBuf};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[cfg(feature = "android")]
 #[unsafe(no_mangle)]
@@ -107,6 +108,7 @@ pub unsafe extern "C" fn entrypoint(
             .resolve::<ThrowRuntimeExAndDefault>();
         return;
     }
+    eprintln!("End of Java Native World.");
 }
 
 pub fn lib_main(conf: android_lib_args::LibLaunchArgs) -> Result<(), Box<dyn Error>> {
@@ -125,7 +127,7 @@ pub fn lib_main(conf: android_lib_args::LibLaunchArgs) -> Result<(), Box<dyn Err
         }
     };
     if let Err(err) = r {
-        eprintln!("daemon error: {:#?}({})", err, err);
+        error!("daemon error: {:#?}({})", err, err);
     }
     Ok(())
 }
@@ -149,6 +151,8 @@ fn run_magisk_daemon(
         .build()?;
     info!("Starting daemon...");
     rt.block_on(daemon_app(kps, smps, smcs, stop_file))?;
+    info!("Shutting down tokio runtime...");
+    rt.shutdown_timeout(Duration::from_secs(5));
     Ok(())
 }
 
@@ -173,6 +177,8 @@ fn run_normal_daemon(
         .build()?;
     info!("Starting daemon...");
     rt.block_on(daemon_app(kps, smps, smcs, stop_file))?;
+    info!("Shutting down tokio runtime...");
+    rt.shutdown_timeout(Duration::from_secs(5));
     Ok(())
 }
 

@@ -6,7 +6,7 @@ use jni::{
 
 pub mod android_lib_args;
 pub mod android_lib_embed;
-pub mod android_lib_func;
+pub mod android_lib_native;
 pub mod android_log;
 pub mod android_opts;
 pub mod conf;
@@ -20,5 +20,5 @@ pub unsafe extern "C" fn Java_com_sbchild_mrs_1speaker_1android_Main_launchMrsSp
     context: JObject,
     json_config: JString,
 ) {
-    unsafe { android_lib_func::entrypoint(maybe_env, _class, context, json_config) }
+    unsafe { android_lib_native::entrypoint(maybe_env, _class, context, json_config) }
 }

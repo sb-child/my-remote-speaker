@@ -58,19 +58,7 @@ impl SampleCacheService {
     }
 
     fn test_db(&self) -> Result<(), SampleCacheError> {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_e) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .name("samplecache-test-rt")
-                    .enable_all()
-                    .build()
-                    .context(StartRuntimeSnafu)?;
-                rt.handle().clone()
-            }
-        };
-
-        handle.block_on(async {
+        let action = async {
             let db = self.db_builder().build().context(LoadDatabaseSnafu {
                 fp: self.store_path.clone(),
             })?;
@@ -78,7 +66,19 @@ impl SampleCacheService {
                 fp: self.store_path.clone(),
             })?;
             Ok(())
-        })
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(action))
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .name("samplecache-test-rt")
+                .enable_all()
+                .build()
+                .context(StartRuntimeSnafu)?;
+            let result = rt.block_on(action);
+            rt.shutdown_timeout(std::time::Duration::from_secs(5));
+            result
+        }
     }
 
     fn rebuild_db(&self) -> Result<(), SampleCacheError> {
