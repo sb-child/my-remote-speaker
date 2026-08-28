@@ -26,9 +26,11 @@ public class Main {
       // target/aarch64-linux-android/release/libmrs_speaker.so
       System.loadLibrary("mrs_speaker");
       launchMrsSpeakerAndroid(context, jsonConfig);
-      System.out.println("Waiting for Looper.loop().");
-      Looper.loop();
-      System.out.println("Looper.loop() breaks.");
+      // no need to wait there
+      // launchMrsSpeakerAndroid is blocking
+      // System.out.println("Waiting for Looper.loop().");
+      // Looper.loop();
+      // System.out.println("Looper.loop() breaks.");
     } catch (Exception e) {
       e.printStackTrace();
     }
