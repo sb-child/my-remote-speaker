@@ -1,4 +1,3 @@
-#[cfg(feature = "android")]
 use crate::android_lib_args;
 use crate::{
     android_log,
@@ -18,8 +17,9 @@ use jni::{
     objects::{JClass, JObject, JString},
     strings::JNIString,
 };
+use std::error::Error;
 #[cfg(feature = "android")]
-use std::{error::Error, ffi::c_void};
+use std::ffi::c_void;
 use std::{fs, path::PathBuf};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};

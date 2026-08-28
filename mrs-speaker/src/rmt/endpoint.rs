@@ -1,13 +1,7 @@
 use crate::rmt::State;
 use futures::StreamExt as _;
-use iroh::{
-    Endpoint, SecretKey,
-    endpoint::{BindError, presets},
-    protocol::Router,
-};
+use iroh::Endpoint;
 use iroh_blobs::{Hash, store::mem::MemStore, ticket::BlobTicket};
-use iroh_mainline_address_lookup::DhtAddressLookup;
-use iroh_mdns_address_lookup::MdnsAddressLookup;
 use my_remote_speaker::{
     rpc::{
         MrsRpcTrait, QuerySampleError, RemoveSampleError, SampleInfo, StoreSampleError,
@@ -20,7 +14,6 @@ use tarpc::{
     server::Channel as _, tokio_serde::formats::Bincode, tokio_util::codec::LengthDelimitedCodec,
 };
 use tokio::{io::AsyncReadExt as _, sync::mpsc};
-use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct RpcEp {
@@ -143,7 +136,7 @@ impl MrsRpcTrait for RpcEp {
     async fn query_audio_sample(
         self,
         _context: ::tarpc::context::Context,
-        sample_hash: Hash,
+        _sample_hash: Hash,
     ) -> Result<SampleInfo, QuerySampleError> {
         todo!()
     }
@@ -151,7 +144,7 @@ impl MrsRpcTrait for RpcEp {
     async fn remove_audio_sample(
         self,
         _context: ::tarpc::context::Context,
-        sample_hash: Hash,
+        _sample_hash: Hash,
     ) -> Result<(), RemoveSampleError> {
         todo!()
     }

@@ -43,7 +43,7 @@ fn sub_commands(sc: Commands) -> Result<(), Box<dyn Error>> {
         Commands::MagiskInstall(mca) => magisk_installed(mca),
         Commands::MagiskDaemon(mca) => run_magisk_daemon(mca),
         Commands::MagiskAction(mca) => on_magisk_action(mca),
-        Commands::MagiskUninstall(_mca) => todo!(),
+        Commands::MagiskUninstall(mca) => on_magisk_uninstall(mca),
         Commands::Daemon(args) => run_daemon(args),
     }
 }
@@ -102,6 +102,11 @@ fn on_magisk_action(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     let kps = rmt::keypair::KeypairService::new(&conf_path)?;
     let pubkey_bytes = kps.read_public_key()?;
     magisk_println!("Public key: [{}]", key_encode(&pubkey_bytes));
+    Ok(())
+}
+
+fn on_magisk_uninstall(_mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
+    // todo: stop current running process, remove conf and temp files
     Ok(())
 }
 

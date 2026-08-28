@@ -1,8 +1,4 @@
-use iroh::{
-    Endpoint, SecretKey,
-    endpoint::{BindError, presets},
-    protocol::Router,
-};
+use iroh::{Endpoint, endpoint::presets, protocol::Router};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use my_remote_speaker::task::TaskManager;

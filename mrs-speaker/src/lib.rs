@@ -1,13 +1,8 @@
 #[cfg(feature = "android")]
 use jni::{
     EnvUnowned,
-    errors::ThrowRuntimeExAndDefault,
     objects::{JClass, JObject, JString},
 };
-#[cfg(feature = "android")]
-use std::error::Error;
-#[cfg(feature = "android")]
-use std::ffi::c_void;
 
 pub mod android_lib_args;
 pub mod android_lib_embed;
