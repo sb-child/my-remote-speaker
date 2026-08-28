@@ -5,6 +5,7 @@ import java.lang.reflect.Method;
 
 public class Main {
   public static void main(String[] args) {
+    System.out.println("=== Into Java World ===");
     System.out.println("Got " + args.length + " params.");
     // for (int i = 0; i < args.length; i++) {
     //   System.out.println("arg[" + i + "]: " + args[i]);

@@ -32,6 +32,7 @@ pub unsafe extern "C" fn entrypoint(
     context: JObject,
     json_config: JString,
 ) {
+    eprintln!("=== Into Java Native World ===");
     if context.is_null() {
         eprintln!("Context is null.");
         return;
@@ -118,8 +119,10 @@ pub fn lib_main(conf: android_lib_args::LibLaunchArgs) -> Result<(), Box<dyn Err
         android_lib_args::LaunchMode::Magisk {
             mod_id: _mod_id,
             module_path: _module_path,
-        } => run_magisk_daemon(conf.conf_path, conf.temp_path),
-        android_lib_args::LaunchMode::Normal => run_daemon(conf.conf_path, conf.temp_path),
+        } => run_magisk_daemon(conf.conf_path, conf.temp_path, conf.stop_file),
+        android_lib_args::LaunchMode::Normal => {
+            run_normal_daemon(conf.conf_path, conf.temp_path, conf.stop_file)
+        }
     };
     if let Err(err) = r {
         eprintln!("daemon error: {:#?}({})", err, err);
@@ -127,7 +130,11 @@ pub fn lib_main(conf: android_lib_args::LibLaunchArgs) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn run_magisk_daemon(conf_path: PathBuf, temp_path: PathBuf) -> Result<(), Box<dyn Error>> {
+fn run_magisk_daemon(
+    conf_path: PathBuf,
+    temp_path: PathBuf,
+    stop_file: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     info!("Starting as magisk daemon.");
     fs::create_dir_all(&conf_path)?;
     fs::create_dir_all(&temp_path)?;
@@ -141,11 +148,15 @@ fn run_magisk_daemon(conf_path: PathBuf, temp_path: PathBuf) -> Result<(), Box<d
         .enable_all()
         .build()?;
     info!("Starting daemon...");
-    rt.block_on(daemon_app(kps, smps, smcs)).unwrap();
+    rt.block_on(daemon_app(kps, smps, smcs, stop_file))?;
     Ok(())
 }
 
-fn run_daemon(conf_path: PathBuf, temp_path: PathBuf) -> Result<(), Box<dyn Error>> {
+fn run_normal_daemon(
+    conf_path: PathBuf,
+    temp_path: PathBuf,
+    stop_file: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
     info!("Starting as normal daemon.");
     fs::create_dir_all(&conf_path)?;
     fs::create_dir_all(&temp_path)?;
@@ -161,7 +172,7 @@ fn run_daemon(conf_path: PathBuf, temp_path: PathBuf) -> Result<(), Box<dyn Erro
         .enable_all()
         .build()?;
     info!("Starting daemon...");
-    rt.block_on(daemon_app(kps, smps, smcs)).unwrap();
+    rt.block_on(daemon_app(kps, smps, smcs, stop_file))?;
     Ok(())
 }
 
@@ -169,10 +180,33 @@ async fn daemon_app(
     kps: KeypairService,
     smps: SampleStoreService,
     smcs: SampleCacheService,
+    stop_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let ct = CancellationToken::new();
+    if let Some(sf) = stop_file {
+        tokio::spawn(stop_file_handler(sf, ct.clone()));
+    }
     rmt::bind_endpoint(kps, smps, smcs, ct).await?;
     Ok(())
+}
+
+async fn stop_file_handler(stop_file: PathBuf, cancel_token: CancellationToken) {
+    info!("Listening to {}", stop_file.display());
+    let mut check_interval = tokio::time::interval(tokio::time::Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+            _ = check_interval.tick() => {
+                if tokio::fs::try_exists(&stop_file).await.unwrap_or(false) {
+                    info!("File {} Created. Cancelling tasks.", stop_file.display());
+                    cancel_token.cancel();
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn test_audio() {

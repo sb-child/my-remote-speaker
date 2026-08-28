@@ -9,11 +9,19 @@ use mrs_speaker::{
 };
 use std::{
     error::Error,
-    fs::{self, Permissions},
-    os::unix::{fs::PermissionsExt as _, process::ExitStatusExt as _},
+    fs::{self, File, Permissions},
+    os::unix::{
+        fs::PermissionsExt as _,
+        process::{CommandExt as _, ExitStatusExt as _},
+    },
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{error, info, warn};
 
@@ -67,6 +75,7 @@ fn run_magisk_daemon(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
         },
         conf_path: std::fs::canonicalize(conf_path)?,
         temp_path: std::fs::canonicalize(temp_path)?,
+        stop_file: None,
     };
     launch_lib(launch_args)?;
     Ok(())
@@ -82,6 +91,7 @@ fn run_daemon(da: DaemonArgs) -> Result<(), Box<dyn Error>> {
         launch_mode: LaunchMode::Normal,
         conf_path: std::fs::canonicalize(conf_path)?,
         temp_path: std::fs::canonicalize(temp_path)?,
+        stop_file: None,
     };
     launch_lib(launch_args)?;
     Ok(())
@@ -95,7 +105,7 @@ fn on_magisk_action(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn launch_lib(launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
+fn launch_lib(mut launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
     struct TempDirGuard {
         path: PathBuf,
     }
@@ -106,7 +116,6 @@ fn launch_lib(launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
             }
         }
     }
-    let launch_args_str = serde_json::to_string(&launch_args)?;
     info!("Extracting payload...");
     let data = get_embedded_payload()?;
     let base_tmp = Path::new("/data/local/tmp");
@@ -132,18 +141,55 @@ fn launch_lib(launch_args: LibLaunchArgs) -> Result<i32, Box<dyn Error>> {
     let permissions = Permissions::from_mode(0o755);
     fs::set_permissions(&jar_path, permissions.clone())?;
     fs::set_permissions(&lib_path, permissions)?;
+    info!("Registered signal handler for Ctrl-C.");
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        warn!("Ctrl-C detected.");
+        r.store(false, Ordering::SeqCst);
+    })?;
     info!("Launch app_process.");
+    let should_stop_path = temp_dir_path.join("should_stop");
+    launch_args
+        .stop_file
+        .replace(std::fs::canonicalize(&should_stop_path)?);
+    let launch_args_str = serde_json::to_string(&launch_args)?;
     let mut cmd = Command::new("/bin/app_process");
     cmd.env("CLASSPATH", &jar_path)
         .env("LD_LIBRARY_PATH", &temp_dir_path);
     cmd.arg(&temp_dir_path)
         .arg("com.sbchild.mrs_speaker_android.Main")
         .arg(&launch_args_str);
-    let status = cmd.status()?;
+    cmd.process_group(0);
+    let mut child = cmd.spawn()?;
+    let mut stop_signaled = false;
+    let mut stop_time: Option<Instant> = None;
+    info!("Launched app_process. Into Java World.");
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if !running.load(Ordering::SeqCst) && !stop_signaled {
+            info!("Creating should_stop file, waiting app_process exit.");
+            stop_signaled = true;
+            let _ = File::create(&should_stop_path);
+            stop_time = Some(Instant::now());
+        }
+        if stop_signaled {
+            if let Some(start_time) = stop_time {
+                if start_time.elapsed() >= Duration::from_secs(3) {
+                    error!("app_process got stuck, force stop.");
+                    let _ = child.kill();
+                    break child.wait()?;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     let exit_code = match status.code() {
         Some(code) => code,
         None => status.signal().map(|s| 128 + s).unwrap_or(-1),
     };
-    info!("app_process returned exit code {exit_code}.");
+    warn!("app_process returned exit code {exit_code}.");
     Ok(exit_code)
 }

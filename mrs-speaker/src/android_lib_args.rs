@@ -7,6 +7,7 @@ pub struct LibLaunchArgs {
     pub launch_mode: LaunchMode,
     pub conf_path: PathBuf,
     pub temp_path: PathBuf,
+    pub stop_file: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
