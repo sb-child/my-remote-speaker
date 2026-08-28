@@ -137,7 +137,9 @@ fn run_magisk_daemon(conf_path: PathBuf, temp_path: PathBuf) -> Result<(), Box<d
     let smcs = SampleCacheService::new(&temp_path)?;
     // let audio_host = cpal::default_host();
     test_audio();
-    let rt = tokio::runtime::Builder::new_multi_thread().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     info!("Starting daemon...");
     rt.block_on(daemon_app(kps, smps, smcs)).unwrap();
     Ok(())
@@ -155,7 +157,9 @@ fn run_daemon(conf_path: PathBuf, temp_path: PathBuf) -> Result<(), Box<dyn Erro
     let smcs = SampleCacheService::new(&temp_path)?;
     // let audio_host = cpal::default_host();
     test_audio();
-    let rt = tokio::runtime::Builder::new_multi_thread().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     info!("Starting daemon...");
     rt.block_on(daemon_app(kps, smps, smcs)).unwrap();
     Ok(())

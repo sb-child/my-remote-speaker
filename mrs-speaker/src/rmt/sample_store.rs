@@ -70,6 +70,7 @@ impl SampleStoreService {
             Err(_e) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .name("samplestore-test-rt")
+                    .enable_all()
                     .build()
                     .context(StartRuntimeSnafu)?;
                 rt.handle().clone()

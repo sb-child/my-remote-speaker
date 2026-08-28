@@ -63,6 +63,7 @@ impl SampleCacheService {
             Err(_e) => {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .name("samplecache-test-rt")
+                    .enable_all()
                     .build()
                     .context(StartRuntimeSnafu)?;
                 rt.handle().clone()

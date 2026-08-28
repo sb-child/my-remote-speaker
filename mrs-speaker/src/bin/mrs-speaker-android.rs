@@ -35,7 +35,7 @@ fn sub_commands(sc: Commands) -> Result<(), Box<dyn Error>> {
         Commands::MagiskInstall(mca) => magisk_installed(mca),
         Commands::MagiskDaemon(mca) => run_magisk_daemon(mca),
         Commands::MagiskAction(mca) => on_magisk_action(mca),
-        Commands::MagiskUninstall(mca) => todo!(),
+        Commands::MagiskUninstall(_mca) => todo!(),
         Commands::Daemon(args) => run_daemon(args),
     }
 }
@@ -63,10 +63,10 @@ fn run_magisk_daemon(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     let launch_args = LibLaunchArgs {
         launch_mode: LaunchMode::Magisk {
             mod_id: mca.module_id,
-            module_path: mca.module_path,
+            module_path: std::fs::canonicalize(mca.module_path)?,
         },
-        conf_path,
-        temp_path,
+        conf_path: std::fs::canonicalize(conf_path)?,
+        temp_path: std::fs::canonicalize(temp_path)?,
     };
     launch_lib(launch_args)?;
     Ok(())
@@ -80,8 +80,8 @@ fn run_daemon(da: DaemonArgs) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&temp_path)?;
     let launch_args = LibLaunchArgs {
         launch_mode: LaunchMode::Normal,
-        conf_path,
-        temp_path,
+        conf_path: std::fs::canonicalize(conf_path)?,
+        temp_path: std::fs::canonicalize(temp_path)?,
     };
     launch_lib(launch_args)?;
     Ok(())

@@ -1,6 +1,6 @@
 package com.sbchild.mrs_speaker_android;
-
 import android.content.Context;
+import android.os.Looper;
 import java.lang.reflect.Method;
 
 public class Main {
@@ -11,6 +11,10 @@ public class Main {
     // }
     String jsonConfig = args.length > 0 ? args[0] : "{}";
     try {
+      if (Looper.myLooper() == null) {
+        System.out.println("Looper.myLooper() is null, creating a new one.");
+        Looper.prepareMainLooper();
+      }
       Class<?> activityThreadClass =
           Class.forName("android.app.ActivityThread");
       Method systemMainMethod = activityThreadClass.getMethod("systemMain");
@@ -21,9 +25,13 @@ public class Main {
       // target/aarch64-linux-android/release/libmrs_speaker.so
       System.loadLibrary("mrs_speaker");
       launchMrsSpeakerAndroid(context, jsonConfig);
+      System.out.println("Waiting for Looper.loop().");
+      Looper.loop();
+      System.out.println("Looper.loop() breaks.");
     } catch (Exception e) {
       e.printStackTrace();
     }
+    System.out.println("End of main.");
   }
   private static native void launchMrsSpeakerAndroid(Object context,
                                                      String jsonConfig);
