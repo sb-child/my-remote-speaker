@@ -20,3 +20,9 @@ tokio = { version = "1.53.1", features = ["full"] }
 [workspace]
 resolver = "3"
 members = ["mrs-speaker", "mrs-client"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -1,18 +1,13 @@
 use clap::Parser as _;
 use mrs_speaker::{
+    android_lib_args::{LaunchMode, LibLaunchArgs},
     android_log::{LogMode, init_tracing},
     android_opts::{Cli, Commands, DaemonArgs, MagiskCommonArgs},
     magisk_println,
-    rmt::{
-        self,
-        keypair::{KeypairService, key_encode},
-        sample_cache::SampleCacheService,
-        sample_store::SampleStoreService,
-    },
+    rmt::{self, keypair::key_encode},
 };
 use std::{error::Error, fs};
-use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info, warn};
 
 fn main() {
     let cli = Cli::parse();
@@ -22,7 +17,7 @@ fn main() {
     };
     init_tracing(log_mode);
     if let Err(err) = sub_commands(cli.command) {
-        tracing::error!("{:#?}", err);
+        error!("Program error: {:#?}({})", err, err);
         std::process::exit(1);
     }
 }
@@ -52,46 +47,39 @@ fn magisk_installed(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_magisk_daemon(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
+    info!("Starting as magisk daemon.");
     let conf_path = mca.module_path.join("conf");
     let temp_path = mca.temp_path.join("mrs-temp");
     fs::create_dir_all(&conf_path)?;
     fs::create_dir_all(&temp_path)?;
-    magisk_println!("Init components...");
-    let kps = rmt::keypair::KeypairService::new(&conf_path)?;
-    let smps = SampleStoreService::new(&conf_path)?;
-    let smcs = SampleCacheService::new(&temp_path)?;
-    let audio_host = cpal::default_host();
-    let rt = tokio::runtime::Builder::new_multi_thread().build()?;
-    magisk_println!("Starting daemon...");
-    rt.block_on(daemon_app(kps, smps, smcs)).unwrap();
+    let launch_args = LibLaunchArgs {
+        launch_mode: LaunchMode::Magisk {
+            mod_id: mca.module_id,
+            module_path: mca.module_path,
+        },
+        conf_path,
+        temp_path,
+    };
+    let launch_args_str = serde_json::to_string(&launch_args)?;
+    info!("Extract files...");
+    // todo
     Ok(())
 }
 
 fn run_daemon(da: DaemonArgs) -> Result<(), Box<dyn Error>> {
+    info!("Starting as normal daemon.");
     let conf_path = da.conf_path.join("mrs-conf");
     let temp_path = da.temp_path.join("mrs-temp");
     fs::create_dir_all(&conf_path)?;
     fs::create_dir_all(&temp_path)?;
-    info!("Init components...");
-    let kps = rmt::keypair::KeypairService::new(&conf_path)?;
-    let pubkey_bytes = kps.read_public_key()?;
-    info!("Public key: [{}]", key_encode(&pubkey_bytes));
-    let smps = SampleStoreService::new(&conf_path)?;
-    let smcs = SampleCacheService::new(&temp_path)?;
-    let audio_host = cpal::default_host();
-    let rt = tokio::runtime::Builder::new_multi_thread().build()?;
-    info!("Starting daemon...");
-    rt.block_on(daemon_app(kps, smps, smcs)).unwrap();
-    Ok(())
-}
-
-async fn daemon_app(
-    kps: KeypairService,
-    smps: SampleStoreService,
-    smcs: SampleCacheService,
-) -> Result<(), Box<dyn Error>> {
-    let ct = CancellationToken::new();
-    rmt::bind_endpoint(kps, smps, smcs, ct).await?;
+    let launch_args = LibLaunchArgs {
+        launch_mode: LaunchMode::Normal,
+        conf_path,
+        temp_path,
+    };
+    let launch_args_str = serde_json::to_string(&launch_args)?;
+    info!("Extract files...");
+    // todo
     Ok(())
 }
 
@@ -102,9 +90,3 @@ fn on_magisk_action(mca: MagiskCommonArgs) -> Result<(), Box<dyn Error>> {
     magisk_println!("Public key: [{}]", key_encode(&pubkey_bytes));
     Ok(())
 }
-
-// #[cfg(not(target_os = "android"))]
-// fn app() {}
-
-// #[cfg(target_os = "android")]
-// fn app() {}

@@ -50,8 +50,14 @@ pub enum LogMode {
 }
 
 pub fn init_tracing(mode: LogMode) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
+    let mut directives = vec!["warn".to_string()];
+    for name in ["my_remote_speaker", "mrs_speaker"] {
+        let target = name.replace('-', "_");
+        directives.push(format!("{}=info", target));
+    }
+    let default_filter = directives.join(",");
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     match mode {
         LogMode::Magisk => {
             fmt()
@@ -65,6 +71,8 @@ pub fn init_tracing(mode: LogMode) {
             fmt()
                 .with_env_filter(env_filter)
                 .with_writer(io::stderr)
+                .with_file(true)
+                .with_line_number(true)
                 .init();
         }
     }

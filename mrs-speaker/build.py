@@ -140,6 +140,107 @@ def get_android_ndk_home(target: str) -> str:
     raise ValueError(f"Failed to find android ndk home for target '{target}'")
 
 
+def build_android_java_entrypoint():
+    platform = "35"
+    java_version = "1.8"
+    build_tools_version = f"{platform}.0.0"
+    env = os.environ.copy()
+    android_home = env.get("ANDROID_HOME")
+    if android_home is None:
+        print("Failed to find ANDROID_HOME.")
+        return False
+    bootclass = Path(android_home) / "platforms" / f"android-{platform}" / "android.jar"
+    code_dir = script_dir / "java-entrypoint"
+    main_file = code_dir / "Main.java"
+    output_dir = code_dir / "out"
+    output_dir.mkdir(exist_ok=True)
+    cmd_header = ["javac", "-source", java_version, "-target", java_version]
+    cmd_bootclass = ["-bootclasspath", str(bootclass.resolve())]
+    cmd_files = ["-d", str(output_dir.resolve()), str(main_file.resolve())]
+    try:
+        _r = subprocess.run(
+            cmd_header + cmd_bootclass + cmd_files,
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to build java entrypoint: {e}")
+        return False
+    cmd_executable = [
+        (Path(android_home) / "build-tools" / build_tools_version / "d8").resolve()
+    ]
+    cmd_files = [
+        (
+            output_dir / "com" / "sbchild" / "mrs_speaker_android" / "Main.class"
+        ).resolve(),
+        "--output",
+        (output_dir / "mrs_speaker_dex.jar").resolve(),
+    ]
+    try:
+        _r = subprocess.run(
+            cmd_executable + cmd_files,
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to convert entrypoint to jar: {e}")
+        return False
+    res = (output_dir / "mrs_speaker_dex.jar").resolve()
+    if not res.is_file():
+        print(f"{res} file not found.")
+        return False
+    return res
+
+
+def build_android_library():
+    if not cargo_install("cargo-ndk", "4.1.2"):
+        print("Failed to install cargo-ndk v4.1.2")
+        return False
+    if not rustup_target_install("aarch64-linux-android"):
+        print("Failed to install aarch64-linux-android target.")
+        return False
+    platform = "35"
+    abi = "arm64-v8a"
+    env = os.environ.copy() | {
+        # https://github.com/DoumanAsh/opusic-sys#android-build
+        "ANDROID_NDK_HOME": get_android_ndk_home(abi)
+    }
+    try:
+        _r = subprocess.run(
+            [
+                "cargo",
+                "ndk",
+                "--platform",
+                platform,
+                "-t",
+                abi,
+                "build",
+                "--lib",
+                "--release",
+                "--no-default-features",
+                "--features",
+                "android",
+            ],
+            check=True,
+            env=env,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to build mrs-speaker library: {e}")
+        return False
+    res = (
+        script_dir
+        / ".."
+        / "target"
+        / "aarch64-linux-android"
+        / "release"
+        / "libmrs_speaker.so"
+    ).resolve()
+    if not res.is_file():
+        print(f"{res} file not found.")
+        return False
+    return res
+
+
 def build_android_binary():
     if not cargo_install("cargo-ndk", "4.1.2"):
         print("Failed to install cargo-ndk v4.1.2")
@@ -167,18 +268,32 @@ def build_android_binary():
                 "mrs-speaker-android",
                 "--release",
                 "--no-default-features",
+                "--features",
+                "android",
             ],
             check=True,
             env=env,
         )
     except subprocess.CalledProcessError as e:
-        print(f"Failed to build: {e}")
+        print(f"Failed to build mrs-speaker-android binary: {e}")
         return False
-    return True
+    res = (
+        script_dir
+        / ".."
+        / "target"
+        / "aarch64-linux-android"
+        / "release"
+        / "mrs-speaker-android"
+    ).resolve()
+    if not res.is_file():
+        print(f"{res} file not found.")
+        return False
+    return res
 
 
 def main():
-    build_android_binary()
+    build_android_java_entrypoint()
+    # build_android_binary()
 
 
 if __name__ == "__main__":
