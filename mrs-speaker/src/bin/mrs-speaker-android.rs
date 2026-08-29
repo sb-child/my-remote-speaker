@@ -9,7 +9,7 @@ use mrs_speaker::{
 };
 use std::{
     error::Error,
-    fs::{self, File, OpenOptions, Permissions},
+    fs::{self, File, Permissions},
     io::Write,
     os::unix::{
         fs::PermissionsExt as _,
@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tempfile::{NamedTempFile, TempDir};
 use tracing::{error, info, warn};

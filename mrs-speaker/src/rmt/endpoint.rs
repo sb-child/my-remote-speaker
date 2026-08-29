@@ -7,13 +7,14 @@ use my_remote_speaker::{
         MrsRpcTrait, QuerySampleError, RemoveSampleError, SampleInfo, StoreSampleError,
         StoreSampleProgress, StoreSampleTaskState, TaskManageError,
     },
-    task::{TaskId, TaskState},
+    task::{TaskChannel, TaskId, TaskState},
 };
 use surrealkv::Tree;
 use tarpc::{
     server::Channel as _, tokio_serde::formats::Bincode, tokio_util::codec::LengthDelimitedCodec,
 };
-use tokio::{io::AsyncReadExt as _, sync::mpsc};
+use tokio::io::AsyncReadExt as _;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct RpcEp {
@@ -49,9 +50,12 @@ async fn store_audio_sample_task(
     ticket: BlobTicket,
     ep: Endpoint,
     ss: Tree,
-    stat: mpsc::UnboundedSender<StoreSampleProgress>,
+    stat: TaskChannel<StoreSampleProgress>,
+    _ct: CancellationToken,
 ) -> Result<(), StoreSampleError> {
-    let _ = stat.send(StoreSampleProgress::CheckingDatabase);
+    stat.update_async(StoreSampleProgress::CheckingDatabase)
+        .await
+        .unwrap();
     let mut tx = ss
         .begin()
         .map_err(|e| StoreSampleError::DatabaseError(e.to_string()))?;
@@ -62,14 +66,18 @@ async fn store_audio_sample_task(
     if let Some(_) = db_result {
         return Err(StoreSampleError::SampleExists);
     }
-    let _ = stat.send(StoreSampleProgress::DownloadingSample);
+    stat.update_async(StoreSampleProgress::DownloadingSample)
+        .await
+        .unwrap();
     let memstore = MemStore::new();
     let downloader = memstore.downloader(&ep);
     downloader
         .download(ticket.hash(), Some(ticket.addr().id))
         .await
         .map_err(|e| StoreSampleError::TicketNotReached(e.to_string()))?;
-    let _ = stat.send(StoreSampleProgress::ReadingBlob);
+    stat.update_async(StoreSampleProgress::ReadingBlob)
+        .await
+        .unwrap();
     // should not be an error
     let mut reader = memstore.blobs().reader(ticket.hash());
     let mut buffer = Vec::new();
@@ -77,9 +85,13 @@ async fn store_audio_sample_task(
         .read_to_end(&mut buffer)
         .await
         .map_err(|e| StoreSampleError::TicketNotReached(e.to_string()))?;
-    let _ = stat.send(StoreSampleProgress::CheckingSampleData);
+    stat.update_async(StoreSampleProgress::CheckingSampleData)
+        .await
+        .unwrap();
     // todo: 检查sample数据
-    let _ = stat.send(StoreSampleProgress::CommittingDatabase);
+    stat.update_async(StoreSampleProgress::CommittingDatabase)
+        .await
+        .unwrap();
     tx.set(&hash_bytes, &buffer)
         .map_err(|e| StoreSampleError::DatabaseError(e.to_string()))?;
     tx.commit()
@@ -100,7 +112,7 @@ impl MrsRpcTrait for RpcEp {
             .ctx
             .task_manager
             .clone()
-            .spawn(|stat| store_audio_sample_task(sample_ticket, ep, ss, stat));
+            .spawn(|stat, ct| store_audio_sample_task(sample_ticket, ep, ss, stat, ct));
         tid
     }
 

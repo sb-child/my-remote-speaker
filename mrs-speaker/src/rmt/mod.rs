@@ -5,7 +5,7 @@ use my_remote_speaker::task::TaskManager;
 use std::fmt::Debug;
 use surrealkv::Tree;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::rmt::{
     endpoint::RpcEp, keypair::KeypairService, sample_cache::SampleCacheService,
@@ -44,18 +44,38 @@ pub async fn bind_endpoint(
         .accept(mrs_rpc_alpn, RpcEp { ctx: ctx.clone() })
         .spawn();
     tokio::select! {
-        _ = cancel_token.cancelled() => {
-            warn!("Stopping bind_endpoint task");
-            if let Err(e) = router.shutdown().await {
-                warn!("Router shutdown error: {:?}", e);
-            }
-            ep.close().await;
-            sample_store.close().await.ok();
-            sample_cache.close().await.ok();
-            task_manager.close();
-        }
+        _ = cancel_token.cancelled() => stop_all_things(router, ep, sample_store, sample_cache, task_manager).await
     }
     Ok(())
+}
+
+async fn stop_all_things(
+    router: Router,
+    ep: Endpoint,
+    sample_store: Tree,
+    sample_cache: Tree,
+    task_manager: TaskManager,
+) {
+    info!("Stopping bind_endpoint task");
+    if let Err(e) = router.shutdown().await {
+        warn!("Error while stopping iroh router: {}", e);
+    } else {
+        info!("Stopped iroh router");
+    }
+    ep.close().await;
+    info!("Stopped iroh endpoint");
+    if let Err(e) = sample_store.close().await {
+        warn!("Error while stopping sample_store database: {}", e);
+    } else {
+        info!("Stopped sample_store database");
+    }
+    if let Err(e) = sample_cache.close().await {
+        warn!("Error while stopping sample_cache database: {}", e);
+    } else {
+        info!("Stopped sample_cache database");
+    }
+    task_manager.close();
+    info!("Stopped task_manager database");
 }
 
 #[derive(Clone)]

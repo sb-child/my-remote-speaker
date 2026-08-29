@@ -9,6 +9,7 @@ pub mod android_lib_embed;
 pub mod android_lib_native;
 pub mod android_log;
 pub mod android_opts;
+pub mod aud;
 pub mod conf;
 pub mod rmt;
 
