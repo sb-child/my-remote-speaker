@@ -7,7 +7,7 @@ use my_remote_speaker::{
         MrsRpcTrait, QuerySampleError, RemoveSampleError, SampleInfo, StoreSampleError,
         StoreSampleProgress, StoreSampleTaskState, TaskManageError,
     },
-    task::{TaskChannel, TaskId, TaskState},
+    task::{TaskChannel, TaskId, TaskState, TypedTaskState},
 };
 use surrealkv::Tree;
 use tarpc::{
@@ -121,24 +121,21 @@ impl MrsRpcTrait for RpcEp {
         _context: ::tarpc::context::Context,
         tid: TaskId,
     ) -> Result<StoreSampleTaskState, TaskManageError> {
-        if let Some(state) = self.ctx.task_manager.get_status(tid) {
+        if let Some(Some(state)) =
+            self.ctx.task_manager.get_status(tid).map(|x| {
+                x.to_typed::<StoreSampleProgress, StoreSampleTaskState, StoreSampleError>()
+            })
+        {
             match state {
-                TaskState::Pending => Ok(StoreSampleTaskState::Pending),
-                TaskState::Running(_) => {
-                    if let Some(progress) = state.downcast_running::<StoreSampleProgress>() {
-                        Ok(StoreSampleTaskState::Running(progress.as_ref().clone()))
-                    } else {
-                        Err(TaskManageError::DowncastError)
-                    }
+                TypedTaskState::Pending => Ok(StoreSampleTaskState::Pending),
+                TypedTaskState::Running(progress) => {
+                    Ok(StoreSampleTaskState::Running(progress.as_ref().clone()))
                 }
-                TaskState::Completed(_) => Ok(StoreSampleTaskState::Completed(())),
-                TaskState::Failed(_) => {
-                    if let Some(err) = state.downcast_failed::<StoreSampleError>() {
-                        Ok(StoreSampleTaskState::Failed(err.as_ref().clone()))
-                    } else {
-                        Err(TaskManageError::DowncastError)
-                    }
+                TypedTaskState::Completed(completed) => Ok(completed.as_ref().clone()),
+                TypedTaskState::Failed(err) => {
+                    Ok(StoreSampleTaskState::Failed(err.as_ref().clone()))
                 }
+                TypedTaskState::Cancelled => Err(TaskManageError::NotFound),
             }
         } else {
             Err(TaskManageError::NotFound)

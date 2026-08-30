@@ -2808,6 +2808,7 @@ dependencies = [
  "chrono",
  "crossfire",
  "dashmap",
+ "futures-util",
  "iroh",
  "iroh-blobs",
  "opus",
@@ -2818,6 +2819,7 @@ dependencies = [
  "tarpc",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
