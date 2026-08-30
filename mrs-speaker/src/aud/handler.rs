@@ -5,13 +5,17 @@ use cpal::{
     SupportedStreamConfig, SupportedStreamConfigRange,
     traits::{DeviceTrait, HostTrait, StreamTrait as _},
 };
-use my_remote_speaker::util::IteratorExt as _;
+use my_remote_speaker::{task::TaskManager, util::IteratorExt as _};
 use snafu::prelude::*;
 
 use crate::aud::dcblocker::DcBlocker;
 
-fn host_handler() {
+fn host_handler(tm: TaskManager) {
     let audio_host = cpal::default_host();
+    // looking for devices every 1s
+    // start device_handler with TaskManager
+    // DeviceDisconnected / DeviceUnavailable -> wait a while then retry
+    // DeviceUnsupported / FormatUnsupported / OtherDeviceError -> ignore until device disconnect and appear again
 }
 
 fn device_handler(dev_id: &cpal::DeviceId) -> Result<(), DeviceHandlerError> {
