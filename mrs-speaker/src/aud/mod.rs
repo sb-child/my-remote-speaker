@@ -1,6 +1,7 @@
 pub mod dcblocker;
 pub mod handler;
 pub mod mixer;
+pub mod sechduler;
 
 use my_remote_speaker::task::TaskManager;
 

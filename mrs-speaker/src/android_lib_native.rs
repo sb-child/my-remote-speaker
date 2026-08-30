@@ -26,8 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "android")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn entrypoint(
+pub fn entrypoint(
     mut maybe_env: EnvUnowned,
     _class: JClass,
     context: JObject,
