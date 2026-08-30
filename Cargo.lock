@@ -2804,17 +2804,21 @@ dependencies = [
 name = "my-remote-speaker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossfire",
  "dashmap",
  "iroh",
  "iroh-blobs",
  "opus",
  "rmp-serde",
+ "rsntp",
  "serde",
  "serde_bytes",
  "tarpc",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4083,6 +4087,16 @@ checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
 dependencies = [
  "rmp",
  "serde",
+]
+
+[[package]]
+name = "rsntp"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc507d0efdc8ce91a17455b1efe9ada6a21e2414470b3f1d84aefc7ebcf247bd"
+dependencies = [
+ "chrono",
+ "tokio",
 ]
 
 [[package]]

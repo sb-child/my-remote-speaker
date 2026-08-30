@@ -12,3 +12,5 @@ pub struct Mixer {}
 ///
 /// 可以放置多个不重叠的片段。
 pub struct Track {}
+
+pub struct Clip {}
