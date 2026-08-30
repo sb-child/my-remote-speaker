@@ -10,6 +10,7 @@ async fn main() {
         .with_env_filter(env_filter)
         .with_file(true)
         .with_line_number(true)
+        .with_target(true)
         .init();
     test_clock().await;
 }

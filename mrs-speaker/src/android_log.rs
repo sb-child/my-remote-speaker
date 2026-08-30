@@ -73,6 +73,7 @@ pub fn init_tracing(mode: LogMode) {
                 .with_writer(io::stderr)
                 .with_file(true)
                 .with_line_number(true)
+                .with_target(true)
                 .init();
         }
     }

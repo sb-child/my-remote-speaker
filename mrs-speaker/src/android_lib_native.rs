@@ -8,7 +8,6 @@ use crate::{
         sample_store::SampleStoreService,
     },
 };
-use cpal::traits::{DeviceTrait as _, HostTrait as _};
 #[cfg(feature = "android")]
 use jni::{
     EnvUnowned,
@@ -17,6 +16,7 @@ use jni::{
     objects::{JClass, JObject, JString},
     strings::JNIString,
 };
+use my_remote_speaker::clock::AccurateClock;
 use std::error::Error;
 #[cfg(feature = "android")]
 use std::ffi::c_void;
@@ -192,6 +192,11 @@ async fn daemon_app(
     if let Some(sf) = stop_file {
         tokio::spawn(stop_file_handler(sf, ct.clone()));
     }
+    let clock = AccurateClock::new();
+    clock.wait_for_sync().await;
+    let now_ntp = clock.now().await;
+    let now_local = chrono::Utc::now();
+    info!("now_ntp = {}, now_local = {}", now_ntp, now_local);
     rmt::bind_endpoint(kps, smps, smcs, ct).await?;
     Ok(())
 }
@@ -216,21 +221,21 @@ async fn stop_file_handler(stop_file: PathBuf, cancel_token: CancellationToken) 
 }
 
 fn test_audio() {
-    let audio_host = cpal::default_host();
-    let default_dev = audio_host.default_output_device();
-    if let Some(dev) = default_dev {
-        info!("default_output_device: {:?}", dev);
-    }
-    match audio_host.output_devices() {
-        Ok(devs) => {
-            for d in devs {
-                info!("output_device: {:?}", d);
-                // let desc = d.description().unwrap();
-                // desc.device_type();
-            }
-        }
-        Err(e) => {
-            warn!("Failed to get output_devices: {:?}", e);
-        }
-    }
+    // let audio_host = cpal::default_host();
+    // let default_dev = audio_host.default_output_device();
+    // if let Some(dev) = default_dev {
+    //     info!("default_output_device: {:?}", dev);
+    // }
+    // match audio_host.output_devices() {
+    //     Ok(devs) => {
+    //         for d in devs {
+    //             info!("output_device: {:?}", d);
+    //             // let desc = d.description().unwrap();
+    //             // desc.device_type();
+    //         }
+    //     }
+    //     Err(e) => {
+    //         warn!("Failed to get output_devices: {:?}", e);
+    //     }
+    // }
 }
