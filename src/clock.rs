@@ -50,14 +50,8 @@ async fn ntp_call(
     match res {
         Ok(Ok(sntp_time)) => {
             let receive_local_time = Utc::now();
-            let sntp_utc: DateTime<Utc> = sntp_time
-                .datetime()
-                .into_chrono_datetime()
-                .unwrap_or_default();
-            let rtt = sntp_time
-                .round_trip_delay()
-                .into_chrono_duration()
-                .unwrap_or_default();
+            let sntp_utc: DateTime<Utc> = sntp_time.datetime().into_chrono_datetime()?;
+            let rtt = sntp_time.round_trip_delay().into_chrono_duration()?;
             let offset = sntp_utc - receive_local_time;
             tracing::debug!(
                 "Offset {} ms, RTT {} ms",
@@ -123,7 +117,7 @@ pub async fn get_ntp_time(
     let median_offset = valid_samples[median_index].offset;
     let accurate_now = Utc::now() + median_offset;
     tracing::debug!(
-        "NTP Synchronization Complete: Median offset {} ms (from {} samples)",
+        "Synchronization Complete: Median offset {} ms (from {} samples)",
         median_offset.num_milliseconds(),
         valid_samples.len()
     );
