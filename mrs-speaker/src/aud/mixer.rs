@@ -38,30 +38,32 @@ impl Track {
     pub fn read_frames(&mut self, mut data: &mut [f32]) -> usize {
         let total_requested = data.len();
         while !data.is_empty() {
-            let Some((clip, pos)) = self.load_next_clip() else {
+            if self.current_clip.is_none() && !self.try_fetch_next_clip() {
                 break;
-            };
-            let n = clip.read_frames(*pos, data);
-            if n == 0 {
-                self.current_clip = None;
-            } else {
-                *pos += n;
-                data = &mut data[n..];
+            }
+            if let Some((clip, pos)) = self.current_clip.as_mut() {
+                let n = clip.read_frames(*pos, data);
+                if n == 0 {
+                    self.current_clip = None;
+                } else {
+                    *pos += n;
+                    data = &mut data[n..];
+                }
             }
         }
+
         total_requested - data.len()
     }
 
-    /// 加载并返回当前可用的 Clip
-    /// - 若 current_clip 为 None，则持续从队列接收，直到拿到有效 Clip 或队列为空。
-    fn load_next_clip(&mut self) -> Option<&mut (Clip, usize)> {
-        while self.current_clip.is_none() {
-            let clip = self.clip_queue_rx.try_recv().ok()?;
+    /// 尝试从 Rx 队列中拉取下一个可用的 Clip
+    fn try_fetch_next_clip(&mut self) -> bool {
+        while let Ok(clip) = self.clip_queue_rx.try_recv() {
             if let Some(c) = clip.into_current_clip() {
                 self.current_clip = Some(c);
+                return true;
             }
         }
-        self.current_clip.as_mut()
+        false
     }
 }
 
