@@ -1,3 +1,4 @@
+pub mod dcblocker;
 pub mod handler;
 pub mod mixer;
 
