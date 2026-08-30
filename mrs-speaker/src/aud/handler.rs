@@ -10,7 +10,7 @@ use snafu::prelude::*;
 
 use crate::aud::dcblocker::DcBlocker;
 
-fn host_handler(tm: TaskManager) {
+fn host_handler(tm: TaskManager, mixers: ()) {
     let audio_host = cpal::default_host();
     // looking for devices every 1s
     // start device_handler with TaskManager
@@ -18,7 +18,7 @@ fn host_handler(tm: TaskManager) {
     // DeviceUnsupported / FormatUnsupported / OtherDeviceError -> ignore until device disconnect and appear again
 }
 
-fn device_handler(dev_id: &cpal::DeviceId) -> Result<(), DeviceHandlerError> {
+fn device_handler(dev_id: &cpal::DeviceId, mixer: ()) -> Result<(), DeviceHandlerError> {
     let audio_host = cpal::default_host();
     let device = audio_host
         .device_by_id(dev_id)
@@ -26,7 +26,7 @@ fn device_handler(dev_id: &cpal::DeviceId) -> Result<(), DeviceHandlerError> {
     let desc = device.description().ok().context(DeviceUnavailableSnafu)?;
     ensure!(device.supports_output(), DeviceUnsupportedSnafu);
     ensure!(
-        !matches!(
+        matches!(
             desc.device_type(),
             DeviceType::Dock
                 | DeviceType::Earpiece
@@ -59,6 +59,7 @@ fn device_handler(dev_id: &cpal::DeviceId) -> Result<(), DeviceHandlerError> {
         device_wait_timeout,
         support_2ch,
         support_f32,
+        mixer,
     )
     .context(StreamSnafu)?;
     Ok(())
@@ -70,6 +71,7 @@ fn stream_handler(
     device_wait_timeout: Duration,
     support_2ch: bool,
     support_f32: bool,
+    mixer: (),
 ) -> Result<(), StreamHandlerError> {
     loop {
         let err_cb = |err: cpal::Error| {};
@@ -85,7 +87,7 @@ fn stream_handler(
                         &mut temp_buf,
                         &mut dc_blocker,
                         support_2ch,
-                        (),
+                        mixer,
                     );
                 },
                 err_cb,
@@ -101,7 +103,7 @@ fn stream_handler(
                         &mut temp_buf,
                         &mut dc_blocker,
                         support_2ch,
-                        (),
+                        mixer,
                     );
                 },
                 err_cb,
@@ -126,10 +128,12 @@ fn stream_handler(
                 }
             },
         };
-        dc_blocker_handle.reset();
-        stream.now();
-        // stream.pause();
-        // todo: wait for any error happens
+        // todo:
+        // wait for mixer commands
+        // call dc_blocker_handle.reset() after stream.pause()
+        // call dc_blocker_handle.reset() before stream.play()
+        // wait for CancellationToken
+        // wait any err_cb error happens
     }
     Ok(())
 }
