@@ -18,16 +18,56 @@ pub struct Mixer {}
 /// 可以放置多个不重叠的片段。
 pub struct Track {
     current_clip: Option<(Clip, usize)>,
-    clip_queue: crossfire::Rx<crossfire::mpsc::Array<()>>,
+    clip_queue_rx: crossfire::Rx<crossfire::mpsc::Array<Clip>>,
 }
 
 impl Track {
-    pub fn read_frames(&self, data: &mut [f32]) {
-        ()
+    pub fn new() -> (Self, TrackHandle) {
+        let current_clip = None;
+        let (clip_queue_tx, clip_queue_rx) = crossfire::mpsc::bounded_async_blocking(128);
+        (
+            Self {
+                current_clip,
+                clip_queue_rx,
+            },
+            TrackHandle { clip_queue_tx },
+        )
+    }
+
+    /// 读取音频轨道，填充 data。返回成功填充的元素数。
+    pub fn read_frames(&mut self, mut data: &mut [f32]) -> usize {
+        let total_requested = data.len();
+        while !data.is_empty() {
+            let Some((clip, pos)) = self.load_next_clip() else {
+                break;
+            };
+            let n = clip.read_frames(*pos, data);
+            if n == 0 {
+                self.current_clip = None;
+            } else {
+                *pos += n;
+                data = &mut data[n..];
+            }
+        }
+        total_requested - data.len()
+    }
+
+    /// 加载并返回当前可用的 Clip
+    /// - 若 current_clip 为 None，则持续从队列接收，直到拿到有效 Clip 或队列为空。
+    fn load_next_clip(&mut self) -> Option<&mut (Clip, usize)> {
+        while self.current_clip.is_none() {
+            let clip = self.clip_queue_rx.try_recv().ok()?;
+            if let Some(c) = clip.into_current_clip() {
+                self.current_clip = Some(c);
+            }
+        }
+        self.current_clip.as_mut()
     }
 }
 
-pub struct TrackHandle {}
+pub struct TrackHandle {
+    clip_queue_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Clip>>,
+}
 
 impl TrackHandle {}
 
@@ -66,7 +106,6 @@ impl Clip {
     }
 
     /// 从 Clip 的第 start_idx 个元素开始向后填充 data。返回成功填充的元素数。
-    ///
     /// - `元素数 * 通道数 = 采样数`
     /// - 直接用新值覆盖 data，不会碰未填充部分。
     pub fn read_frames(&self, start_idx: usize, data: &mut [f32]) -> usize {
