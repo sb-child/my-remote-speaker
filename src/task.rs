@@ -228,7 +228,7 @@ impl TaskManager {
         TaskHandle::new(id, self.clone())
     }
 
-    pub fn spawn_blocking_typed<F, Fut, P, T, E>(&self, f: F) -> TaskHandle<P, T, E>
+    pub fn spawn_blocking_typed<F, P, T, E>(&self, f: F) -> TaskHandle<P, T, E>
     where
         F: FnOnce(TaskChannel<P>, CancellationToken) -> Result<T, E> + Send + 'static,
         P: Send + Sync + 'static + Unpin,

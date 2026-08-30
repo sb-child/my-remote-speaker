@@ -1,12 +1,16 @@
-use std::{thread, time::Duration};
+use std::{collections::HashMap, thread, time::Duration};
 
 use cpal::{
     BufferSize, DeviceType, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedOutputConfigs,
     SupportedStreamConfig, SupportedStreamConfigRange,
     traits::{DeviceTrait, HostTrait, StreamTrait as _},
 };
-use my_remote_speaker::{task::TaskManager, util::IteratorExt as _};
+use my_remote_speaker::{
+    task::{TaskHandle, TaskManager, TypedTaskState},
+    util::IteratorExt as _,
+};
 use snafu::prelude::*;
+use tracing::{info, instrument};
 
 use crate::aud::dcblocker::DcBlocker;
 
@@ -16,9 +20,80 @@ fn host_handler(tm: TaskManager, mixers: ()) {
     // start device_handler with TaskManager
     // DeviceDisconnected / DeviceUnavailable -> wait a while then retry
     // DeviceUnsupported / FormatUnsupported / OtherDeviceError -> ignore until device disconnect and appear again
+    let mut device_handles: HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>> =
+        HashMap::new();
+    loop {
+        let devices_snapshot = audio_host.output_devices().unwrap(); // todo: error handling
+        for dev in devices_snapshot {
+            let dev_id = dev.id().unwrap();
+            if let Some(_) = device_handles.get(&dev_id) {
+                continue;
+            }
+            let dev_id_str = dev_id.to_string();
+            let dev_id_2 = dev_id.clone();
+            let h = tm.spawn_blocking_typed(move |tc, ct| {
+                tc.update(()).ok(); // todo
+                ct.is_cancelled(); // todo
+                device_handler(&dev_id_str, &dev_id_2, ())
+            });
+            if let Some(old_dev) = device_handles.insert(dev_id, h) {
+                old_dev.cancel(); // maybe unreachable
+            };
+        }
+        for (dev_id, handle) in &device_handles {
+            match handle.status() {
+                Some(Some(status)) => match status {
+                    TypedTaskState::Pending => {
+                        // just wait
+                    }
+                    TypedTaskState::Running(r) => {
+                        // just wait
+                    }
+                    TypedTaskState::Completed(c) => {
+                        // no. -> wait a while then retry
+                    }
+                    TypedTaskState::Failed(f) => match f.as_ref() {
+                        DeviceHandlerError::DeviceUnavailable => {
+                            // wait a while then retry
+                        }
+                        DeviceHandlerError::DeviceUnsupported => {
+                            // ignore until device disconnect and appear again
+                        }
+                        DeviceHandlerError::Stream { source } => match source {
+                            StreamHandlerError::DeviceDisconnected { source } => {
+                                // wait a while then retry
+                            }
+                            StreamHandlerError::FormatUnsupported { source } => {
+                                // ignore until device disconnect and appear again
+                            }
+                            StreamHandlerError::OtherDeviceError { source } => {
+                                // ignore until device disconnect and appear again
+                            }
+                        },
+                    },
+                    TypedTaskState::Cancelled => {
+                        // cancelled -> wait a while then retry
+                    }
+                },
+                Some(None) => {
+                    // type not match -> wait a while then retry
+                }
+                None => {
+                    // task gone -> wait a while then retry
+                }
+            };
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
-fn device_handler(dev_id: &cpal::DeviceId, mixer: ()) -> Result<(), DeviceHandlerError> {
+#[instrument(skip_all, fields(device = _dev_id))]
+fn device_handler(
+    _dev_id: &str,
+    dev_id: &cpal::DeviceId,
+    mixer: (),
+) -> Result<(), DeviceHandlerError> {
+    info!("Init device...");
     let audio_host = cpal::default_host();
     let device = audio_host
         .device_by_id(dev_id)
@@ -54,6 +129,7 @@ fn device_handler(dev_id: &cpal::DeviceId, mixer: ()) -> Result<(), DeviceHandle
     };
     let device_wait_timeout = Duration::from_secs(1);
     stream_handler(
+        &dev_id.to_string(),
         device,
         stream_config,
         device_wait_timeout,
@@ -65,7 +141,9 @@ fn device_handler(dev_id: &cpal::DeviceId, mixer: ()) -> Result<(), DeviceHandle
     Ok(())
 }
 
+#[instrument(skip_all, fields(device = _dev_id, supp_2ch = support_2ch, supp_f32 = support_f32))]
 fn stream_handler(
+    _dev_id: &str,
     device: cpal::Device,
     stream_config: StreamConfig,
     device_wait_timeout: Duration,
@@ -74,6 +152,7 @@ fn stream_handler(
     mixer: (),
 ) -> Result<(), StreamHandlerError> {
     loop {
+        info!("Building output stream...");
         let err_cb = |err: cpal::Error| {};
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
@@ -128,6 +207,7 @@ fn stream_handler(
                 }
             },
         };
+        info!("Stream started, waiting for events.");
         // todo:
         // wait for mixer commands
         // call dc_blocker_handle.reset() after stream.pause()
