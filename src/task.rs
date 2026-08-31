@@ -409,8 +409,8 @@ where
         }
     }
 
-    pub fn status(&self) -> Option<Option<TypedTaskState<P, T, E>>> {
-        self.manager.get_status(self.id).map(|s| s.to_typed())
+    pub fn status(&self) -> Option<TypedTaskState<P, T, E>> {
+        self.manager.get_status(self.id).map(|s| s.to_typed()).flatten()
     }
 
     pub fn cancel(&self) {

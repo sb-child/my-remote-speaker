@@ -1,4 +1,8 @@
-use std::{collections::HashMap, thread, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 
 use cpal::{
     BufferSize, DeviceType, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedOutputConfigs,
@@ -10,78 +14,182 @@ use my_remote_speaker::{
     util::IteratorExt as _,
 };
 use snafu::prelude::*;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::aud::dcblocker::DcBlocker;
 
-fn host_handler(tm: TaskManager, mixers: ()) {
-    let audio_host = cpal::default_host();
-    // looking for devices every 1s
-    // start device_handler with TaskManager
-    // DeviceDisconnected / DeviceUnavailable -> wait a while then retry
-    // DeviceUnsupported / FormatUnsupported / OtherDeviceError -> ignore until device disconnect and appear again
-    let mut device_handles: HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>> =
-        HashMap::new();
-    loop {
-        let devices_snapshot = audio_host.output_devices().unwrap(); // todo: error handling
-        for dev in devices_snapshot {
-            let dev_id = dev.id().unwrap();
-            if let Some(_) = device_handles.get(&dev_id) {
-                continue;
-            }
-            let dev_id_str = dev_id.to_string();
-            let dev_id_2 = dev_id.clone();
-            let h = tm.spawn_blocking_typed(move |tc, ct| {
-                tc.update(()).ok(); // todo
-                ct.is_cancelled(); // todo
-                device_handler(&dev_id_str, &dev_id_2, ())
-            });
-            if let Some(old_dev) = device_handles.insert(dev_id, h) {
-                old_dev.cancel(); // maybe unreachable
-            };
+type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
+
+#[instrument(skip_all, fields(device = dev_id_str))]
+fn on_device_add(
+    dev_id_str: String,
+    dev_id: cpal::DeviceId,
+    dh: &mut DeviceHandles,
+    tm: &TaskManager,
+) {
+    let dev_id_2 = dev_id.clone();
+    let h = tm.spawn_blocking_typed(move |tc, ct| {
+        tc.update(()).ok(); // todo
+        ct.is_cancelled(); // todo
+        device_handler(&dev_id_str, &dev_id_2, ())
+    });
+    if let Some(old_task) = dh.insert(dev_id, h) {
+        warn!("Task started. Cancelling old task.");
+        old_task.cancel(); // maybe unreachable
+    } else {
+        info!("Task started.");
+    };
+}
+
+#[instrument(skip_all, fields(device = dev_id_str))]
+fn on_device_del(
+    dev_id_str: String,
+    dev_id: cpal::DeviceId,
+    dh: &mut DeviceHandles,
+    _tm: &TaskManager,
+) {
+    if let Some(task) = dh.remove(&dev_id) {
+        info!("Cancelling task.");
+        task.cancel();
+    } else {
+        warn!("Task not found.");
+    };
+}
+
+/// - true: set blacklisted
+/// - false: no action required
+#[instrument(skip_all, fields(device = dev_id_str, blacklisted = blacklisted))]
+fn on_device_online(
+    dev_id_str: String,
+    dev_id: cpal::DeviceId,
+    blacklisted: bool,
+    dh: &mut DeviceHandles,
+    tm: &TaskManager,
+) -> bool {
+    if let Some(task) = dh.get(&dev_id) {
+        let s = get_device_status(dev_id_str.clone(), task.status());
+        match s {
+            Some(true) => return true,
+            Some(false) => {}
+            None => return false,
         }
-        for (dev_id, handle) in &device_handles {
-            match handle.status() {
-                Some(Some(status)) => match status {
-                    TypedTaskState::Pending => {
-                        // just wait
+    }
+    let dev_id_2 = dev_id.clone();
+    let h = tm.spawn_blocking_typed(move |tc, ct| {
+        tc.update(()).ok(); // todo
+        ct.is_cancelled(); // todo
+        device_handler(&dev_id_str, &dev_id_2, ())
+    });
+    if let Some(old_task) = dh.insert(dev_id, h) {
+        warn!("Task restarted. Cancelling old task.");
+        old_task.cancel(); // maybe unreachable
+    } else {
+        info!("Task restarted.");
+    };
+    false
+}
+
+/// - Some(true): device unsupported
+/// - Some(false): device disconnected
+/// - None: no action required
+#[instrument(skip_all, fields(device = _dev_id_str))]
+fn get_device_status(
+    _dev_id_str: String,
+    s: Option<TypedTaskState<(), (), DeviceHandlerError>>,
+) -> Option<bool> {
+    match s {
+        Some(status) => match status {
+            TypedTaskState::Pending => None,
+            TypedTaskState::Running(_r) => None,
+            TypedTaskState::Completed(_c) => {
+                info!("Task completed.");
+                Some(false)
+            }
+            TypedTaskState::Failed(f) => match f.as_ref() {
+                DeviceHandlerError::DeviceUnavailable => {
+                    info!("Task failed because of unavailable.");
+                    Some(false)
+                }
+                DeviceHandlerError::DeviceUnsupported => {
+                    info!("Task failed because of device type unsupported.");
+                    Some(true)
+                }
+                DeviceHandlerError::Stream { source } => match source {
+                    StreamHandlerError::DeviceDisconnected { source } => {
+                        info!(
+                            "Task failed because of disconnected during streaming: {}",
+                            source
+                        );
+                        Some(false)
                     }
-                    TypedTaskState::Running(r) => {
-                        // just wait
+                    StreamHandlerError::FormatUnsupported { source } => {
+                        info!("Task failed because of format unsupported: {}", source);
+                        Some(true)
                     }
-                    TypedTaskState::Completed(c) => {
-                        // no. -> wait a while then retry
-                    }
-                    TypedTaskState::Failed(f) => match f.as_ref() {
-                        DeviceHandlerError::DeviceUnavailable => {
-                            // wait a while then retry
-                        }
-                        DeviceHandlerError::DeviceUnsupported => {
-                            // ignore until device disconnect and appear again
-                        }
-                        DeviceHandlerError::Stream { source } => match source {
-                            StreamHandlerError::DeviceDisconnected { source } => {
-                                // wait a while then retry
-                            }
-                            StreamHandlerError::FormatUnsupported { source } => {
-                                // ignore until device disconnect and appear again
-                            }
-                            StreamHandlerError::OtherDeviceError { source } => {
-                                // ignore until device disconnect and appear again
-                            }
-                        },
-                    },
-                    TypedTaskState::Cancelled => {
-                        // cancelled -> wait a while then retry
+                    StreamHandlerError::OtherDeviceError { source } => {
+                        info!("Task failed because of other reason: {}", source);
+                        Some(true)
                     }
                 },
-                Some(None) => {
-                    // type not match -> wait a while then retry
-                }
-                None => {
-                    // task gone -> wait a while then retry
-                }
+            },
+            TypedTaskState::Cancelled => Some(false),
+        },
+        None => Some(false),
+    }
+}
+
+fn host_handler(tm: TaskManager, mixers: ()) {
+    let audio_host = cpal::default_host();
+    enum Action {
+        OnDeviceAdd,
+        OnDeviceDel,
+        OnDeviceOnline(bool),
+    }
+    let mut device_handles: DeviceHandles = HashMap::new();
+    // `value = true` -> blacklisted (device unsupported)
+    let mut prev_devices: HashMap<cpal::DeviceId, bool> = HashMap::new();
+    loop {
+        let devices_snapshot = audio_host.output_devices().unwrap(); // todo: error handling
+        let mut actions: HashMap<cpal::DeviceId, Action> = HashMap::new();
+        let mut current_devices: HashSet<cpal::DeviceId> = HashSet::new();
+        for dev in devices_snapshot {
+            let dev_id = match dev.id() {
+                Ok(d) => d,
+                Err(_) => continue, // device suddenly disconnected
             };
+            current_devices.insert(dev_id.clone());
+            if let Some(blacklisted) = prev_devices.get(&dev_id) {
+                actions.insert(dev_id, Action::OnDeviceOnline(*blacklisted));
+            } else {
+                actions.insert(dev_id.clone(), Action::OnDeviceAdd);
+                prev_devices.insert(dev_id, false);
+            }
+        }
+        prev_devices.retain(|dev_id, _| {
+            let is_present = current_devices.contains(dev_id);
+            if !is_present {
+                actions.insert(dev_id.clone(), Action::OnDeviceDel);
+            }
+            is_present
+        });
+        for (dev_id, action) in actions {
+            let dev_id_str = dev_id.to_string();
+            match action {
+                Action::OnDeviceAdd => on_device_add(dev_id_str, dev_id, &mut device_handles, &tm),
+                Action::OnDeviceDel => on_device_del(dev_id_str, dev_id, &mut device_handles, &tm),
+                Action::OnDeviceOnline(blacklisted) => {
+                    let should_blacklist_this = on_device_online(
+                        dev_id_str,
+                        dev_id.clone(),
+                        blacklisted,
+                        &mut device_handles,
+                        &tm,
+                    );
+                    if should_blacklist_this {
+                        prev_devices.insert(dev_id, true);
+                    }
+                }
+            }
         }
         thread::sleep(Duration::from_secs(1));
     }
