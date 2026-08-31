@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["sbchild <sbchild0@gmail.com>"]
+default-run = "mrs-speaker-tests"
 
 [lib]
 crate-type = ["cdylib", "lib"]

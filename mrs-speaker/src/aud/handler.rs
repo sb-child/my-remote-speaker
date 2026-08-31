@@ -138,7 +138,7 @@ fn get_device_status(
     }
 }
 
-fn host_handler(tm: TaskManager, mixers: ()) {
+pub fn host_handler(tm: TaskManager, mixers: ()) {
     let audio_host = cpal::default_host();
     enum Action {
         OnDeviceAdd,
@@ -316,6 +316,9 @@ fn stream_handler(
             },
         };
         info!("Stream started, waiting for events.");
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
         // todo:
         // wait for mixer commands
         // call dc_blocker_handle.reset() after stream.pause()
