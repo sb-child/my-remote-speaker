@@ -14,7 +14,7 @@ use my_remote_speaker::{
     util::IteratorExt as _,
 };
 use snafu::prelude::*;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::aud::dcblocker::DcBlocker;
 
@@ -208,27 +208,35 @@ fn device_handler(
         .context(DeviceUnavailableSnafu)?;
     let desc = device.description().ok().context(DeviceUnavailableSnafu)?;
     ensure!(device.supports_output(), DeviceUnsupportedSnafu);
-    ensure!(
-        matches!(
-            desc.device_type(),
-            DeviceType::Dock
-                | DeviceType::Earpiece
-                | DeviceType::Handset
-                | DeviceType::Headphones
-                | DeviceType::Headset
-                | DeviceType::HearingAid
-                | DeviceType::Speaker
-                | DeviceType::Virtual
-        ),
-        DeviceUnsupportedSnafu
-    );
+    debug!("device supports output.");
+    // many device reported as Unknown
+    // ensure!(
+    //     matches!(
+    //         desc.device_type(),
+    //         DeviceType::Dock
+    //             | DeviceType::Earpiece
+    //             | DeviceType::Handset
+    //             | DeviceType::Headphones
+    //             | DeviceType::Headset
+    //             | DeviceType::HearingAid
+    //             | DeviceType::Speaker
+    //             | DeviceType::Virtual
+    //     ),
+    //     DeviceUnsupportedSnafu
+    // );
+    // debug!("device type supported.");
     let soc = device
         .supported_output_configs()
         .ok()
         .context(DeviceUnsupportedSnafu)?;
+    debug!("got supported_output_configs.");
     let sample_rate = 48000;
     let (support_f32, support_2ch) =
         get_supported_config(soc, sample_rate).context(DeviceUnsupportedSnafu)?;
+    debug!(
+        "config: support_f32={}, support_2ch={}",
+        support_f32, support_2ch
+    );
     let stream_config = StreamConfig {
         channels: if support_2ch { 2 } else { 1 },
         sample_rate: sample_rate,

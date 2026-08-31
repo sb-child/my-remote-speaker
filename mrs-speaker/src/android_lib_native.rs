@@ -149,7 +149,11 @@ fn run_magisk_daemon(
         .enable_all()
         .build()?;
     info!("Starting daemon...");
-    rt.block_on(daemon_app(kps, smps, smcs, stop_file))?;
+    let r = rt.block_on(daemon_app(kps, smps, smcs, stop_file));
+    match r {
+        Ok(r) => info!("Daemon returns {:?}", r),
+        Err(e) => error!("Daemon returns {}", e),
+    }
     info!("Shutting down tokio runtime...");
     rt.shutdown_timeout(Duration::from_secs(5));
     Ok(())
@@ -175,7 +179,11 @@ fn run_normal_daemon(
         .enable_all()
         .build()?;
     info!("Starting daemon...");
-    rt.block_on(daemon_app(kps, smps, smcs, stop_file))?;
+    let r = rt.block_on(daemon_app(kps, smps, smcs, stop_file));
+    match r {
+        Ok(r) => info!("Daemon returns {:?}", r),
+        Err(e) => error!("Daemon returns {}", e),
+    }
     info!("Shutting down tokio runtime...");
     rt.shutdown_timeout(Duration::from_secs(5));
     Ok(())

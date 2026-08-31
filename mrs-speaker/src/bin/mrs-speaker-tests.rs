@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use mrs_speaker::aud;
 use my_remote_speaker::task::TaskManager;
 use std::time::Duration;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 /// mrs-speaker Test CLI
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| EnvFilter::new("warn,my_remote_speaker=info,mrs_speaker=info"));
     fmt()
         .with_env_filter(env_filter)
-        .with_file(true)
+        .with_file(false)
         .with_line_number(true)
         .with_target(true)
         .init();
@@ -38,12 +38,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let args = Cli::parse();
+    let task_name = format!("{:?}", args.command);
     let t = match args.command {
         Commands::AudioHandler => audio_handler_test(),
     };
-    rt.block_on(t)?;
-    info!("Shutting down tokio runtime...");
+    info!("Starting task {}.", task_name);
+    let r = rt.block_on(async {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => { r.map_err(|e| Box::new(e).into()) }
+            r = t => { r.map_err(|e| e) }
+        }
+    });
+    match r {
+        Ok(r) => info!("Task returns {:?}", r),
+        Err(e) => error!("Task returns {}", e),
+    }
+    warn!("Shutting down tokio runtime...");
     rt.shutdown_timeout(Duration::from_secs(5));
+    warn!("Stopped.");
     Ok(())
 }
 
@@ -51,8 +63,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn audio_handler_test() -> Result<(), Box<dyn std::error::Error>> {
     let tm = TaskManager::new();
-    aud::handler::host_handler(tm.clone(), ());
+    let tm2 = tm.clone();
+    let h = tokio::task::spawn_blocking(|| {
+        aud::handler::host_handler(tm2, ());
+    });
     tokio::time::sleep(Duration::from_secs(30)).await;
     tm.close();
+    h.await?;
     Ok(())
 }
