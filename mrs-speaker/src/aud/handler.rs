@@ -14,7 +14,8 @@ use my_remote_speaker::{
     util::IteratorExt as _,
 };
 use snafu::prelude::*;
-use tracing::{debug, info, instrument, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::aud::dcblocker::DcBlocker;
 
@@ -30,8 +31,7 @@ fn on_device_add(
     let dev_id_2 = dev_id.clone();
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()).ok(); // todo
-        ct.is_cancelled(); // todo
-        device_handler(&dev_id_str, &dev_id_2, ())
+        device_handler(&dev_id_str, &dev_id_2, (), ct)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task started. Cancelling old task.");
@@ -77,8 +77,7 @@ fn on_device_online(
     let dev_id_2 = dev_id.clone();
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()).ok(); // todo
-        ct.is_cancelled(); // todo
-        device_handler(&dev_id_str, &dev_id_2, ())
+        device_handler(&dev_id_str, &dev_id_2, (), ct)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task restarted. Cancelling old task.");
@@ -92,9 +91,9 @@ fn on_device_online(
 /// - Some(true): device unsupported
 /// - Some(false): device disconnected
 /// - None: no action required
-#[instrument(skip_all, fields(device = _dev_id_str))]
+#[instrument(skip_all, fields(device = dev_id_str))]
 fn get_device_status(
-    _dev_id_str: String,
+    dev_id_str: String,
     s: Option<TypedTaskState<(), (), DeviceHandlerError>>,
 ) -> Option<bool> {
     match s {
@@ -102,43 +101,49 @@ fn get_device_status(
             TypedTaskState::Pending => None,
             TypedTaskState::Running(_r) => None,
             TypedTaskState::Completed(_c) => {
-                info!("Task completed.");
-                Some(false)
+                warn!("Task completed. Will not restart.");
+                None
             }
             TypedTaskState::Failed(f) => match f.as_ref() {
                 DeviceHandlerError::DeviceUnavailable => {
-                    info!("Task failed because of unavailable.");
+                    info!("Failed because of unavailable.");
                     Some(false)
                 }
                 DeviceHandlerError::DeviceUnsupported => {
-                    info!("Task failed because of device type unsupported.");
+                    info!("Failed because of device type unsupported.");
                     Some(true)
                 }
                 DeviceHandlerError::Stream { source } => match source {
                     StreamHandlerError::DeviceDisconnected { source } => {
                         info!(
-                            "Task failed because of disconnected during streaming: {}",
+                            "Failed because of disconnected during streaming: {}",
                             source
                         );
                         Some(false)
                     }
                     StreamHandlerError::FormatUnsupported { source } => {
-                        info!("Task failed because of format unsupported: {}", source);
+                        info!("Failed because of format unsupported: {}", source);
                         Some(true)
                     }
                     StreamHandlerError::OtherDeviceError { source } => {
-                        info!("Task failed because of other reason: {}", source);
+                        info!("Failed because of other reason: {}", source);
                         Some(true)
                     }
                 },
             },
-            TypedTaskState::Cancelled => Some(false),
+            TypedTaskState::Cancelled => {
+                warn!("Cancelled by TaskManager. Will not restart.");
+                None
+            }
         },
-        None => Some(false),
+        None => {
+            warn!("Deleted by TaskManager. Will not restart.");
+            None
+        }
     }
 }
 
-pub fn host_handler(tm: TaskManager, mixers: ()) {
+pub fn host_handler(tm: TaskManager, mixers: (), ct: CancellationToken) {
     let audio_host = cpal::default_host();
     enum Action {
         OnDeviceAdd,
@@ -149,7 +154,13 @@ pub fn host_handler(tm: TaskManager, mixers: ()) {
     // `value = true` -> blacklisted (device unsupported)
     let mut prev_devices: HashMap<cpal::DeviceId, bool> = HashMap::new();
     loop {
-        let devices_snapshot = audio_host.output_devices().unwrap(); // todo: error handling
+        let devices_snapshot = match audio_host.output_devices() {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to enumerate output devices: {}", e);
+                break;
+            }
+        };
         let mut actions: HashMap<cpal::DeviceId, Action> = HashMap::new();
         let mut current_devices: HashSet<cpal::DeviceId> = HashSet::new();
         for dev in devices_snapshot {
@@ -191,7 +202,15 @@ pub fn host_handler(tm: TaskManager, mixers: ()) {
                 }
             }
         }
-        thread::sleep(Duration::from_secs(1));
+        if ct.is_cancelled() {
+            error!("Cancelled. Stopping all handles.");
+            for (_, h) in &device_handles {
+                h.cancel();
+            }
+            break;
+        } else {
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 
@@ -200,6 +219,7 @@ fn device_handler(
     _dev_id: &str,
     dev_id: &cpal::DeviceId,
     mixer: (),
+    ct: CancellationToken,
 ) -> Result<(), DeviceHandlerError> {
     info!("Init device...");
     let audio_host = cpal::default_host();
@@ -252,6 +272,7 @@ fn device_handler(
         support_2ch,
         support_f32,
         mixer,
+        ct,
     )
     .context(StreamSnafu)?;
     Ok(())
@@ -266,6 +287,7 @@ fn stream_handler(
     support_2ch: bool,
     support_f32: bool,
     mixer: (),
+    ct: CancellationToken,
 ) -> Result<(), StreamHandlerError> {
     loop {
         info!("Building output stream...");
@@ -325,8 +347,14 @@ fn stream_handler(
         };
         info!("Stream started, waiting for events.");
         loop {
-            thread::sleep(Duration::from_secs(1));
+            if ct.is_cancelled() {
+                warn!("Cancelled.");
+                return Ok(());
+            } else {
+                thread::sleep(Duration::from_secs(1));
+            }
         }
+
         // todo:
         // wait for mixer commands
         // call dc_blocker_handle.reset() after stream.pause()

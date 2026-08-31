@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use mrs_speaker::aud;
 use my_remote_speaker::task::TaskManager;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -63,11 +64,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn audio_handler_test() -> Result<(), Box<dyn std::error::Error>> {
     let tm = TaskManager::new();
+    let ct = CancellationToken::new();
     let tm2 = tm.clone();
+    let ct2 = ct.clone();
     let h = tokio::task::spawn_blocking(|| {
-        aud::handler::host_handler(tm2, ());
+        aud::handler::host_handler(tm2, (), ct2);
     });
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    warn!("Triggering CancellationToken.");
+    ct.cancel();
     tm.close();
     h.await?;
     Ok(())

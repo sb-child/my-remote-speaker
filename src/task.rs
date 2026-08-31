@@ -7,7 +7,7 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -203,6 +203,7 @@ impl Drop for TaskGuard {
 #[derive(Clone, Default)]
 pub struct TaskManager {
     next_id: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
     tasks: Arc<DashMap<TaskId, TaskState>>,
     handles: Arc<DashMap<TaskId, (JoinHandle<()>, CancellationToken)>>,
 }
@@ -211,6 +212,7 @@ impl TaskManager {
     pub fn new() -> Self {
         Self {
             next_id: Arc::new(AtomicU64::new(1)),
+            closed: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(DashMap::new()),
             handles: Arc::new(DashMap::new()),
         }
@@ -248,6 +250,15 @@ impl TaskManager {
         E: Send + Sync + 'static,
     {
         let task_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            self.tasks.insert(task_id, TaskState::Cancelled);
+            let tasks = Arc::clone(&self.tasks);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                tasks.remove(&task_id);
+            });
+            return task_id;
+        }
         let token = CancellationToken::new();
         let task_token = token.clone();
         let (status_tx, status_rx) = TaskChannel::new();
@@ -288,7 +299,9 @@ impl TaskManager {
             }
         });
         self.handles.insert(task_id, (worker_handle, token));
-        if let Some(state) = self.tasks.get(&task_id) {
+        if self.closed.load(Ordering::SeqCst) {
+            self.cancel_task(task_id);
+        } else if let Some(state) = self.tasks.get(&task_id) {
             if state.is_terminal() {
                 self.handles.remove(&task_id);
             }
@@ -304,6 +317,15 @@ impl TaskManager {
         E: Send + Sync + 'static,
     {
         let task_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        if self.closed.load(Ordering::SeqCst) {
+            self.tasks.insert(task_id, TaskState::Cancelled);
+            let tasks = Arc::clone(&self.tasks);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                tasks.remove(&task_id);
+            });
+            return task_id;
+        }
         let token = CancellationToken::new();
         let task_token = token.clone();
         let (status_tx, status_rx) = TaskChannel::new();
@@ -346,7 +368,9 @@ impl TaskManager {
             }
         });
         self.handles.insert(task_id, (worker_handle, token));
-        if let Some(state) = self.tasks.get(&task_id) {
+        if self.closed.load(Ordering::SeqCst) {
+            self.cancel_task(task_id);
+        } else if let Some(state) = self.tasks.get(&task_id) {
             if state.is_terminal() {
                 self.handles.remove(&task_id);
             }
@@ -381,11 +405,16 @@ impl TaskManager {
     }
 
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         let task_ids: Vec<TaskId> = self.handles.iter().map(|entry| *entry.key()).collect();
         for id in task_ids {
             self.cancel_task(id);
             self.tasks.remove(&id);
         }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -410,7 +439,10 @@ where
     }
 
     pub fn status(&self) -> Option<TypedTaskState<P, T, E>> {
-        self.manager.get_status(self.id).map(|s| s.to_typed()).flatten()
+        self.manager
+            .get_status(self.id)
+            .map(|s| s.to_typed())
+            .flatten()
     }
 
     pub fn cancel(&self) {
