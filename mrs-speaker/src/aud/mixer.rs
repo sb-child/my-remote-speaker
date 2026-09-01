@@ -11,7 +11,45 @@ pub struct Mixers {}
 /// 混音器
 ///
 /// 可以挂载多个轨道，合并为一个输出。
-pub struct Mixer {}
+pub struct Mixer {
+    output_tx: crossfire::MTx<crossfire::mpmc::Array<Vec<f32>>>,
+    trig_rx: crossfire::MRx<crossfire::mpmc::Array<usize>>,
+}
+
+impl Mixer {
+    pub fn new() -> (Self, MixerOutput) {
+        let (output_tx, output_rx) = crossfire::mpmc::bounded_blocking(1);
+        let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
+        (
+            Self { output_tx, trig_rx },
+            MixerOutput { output_rx, trig_tx },
+        )
+    }
+}
+
+/// 设计上只允许一个线程读取，不要并发读。
+#[derive(Clone)]
+pub struct MixerOutput {
+    output_rx: crossfire::MRx<crossfire::mpmc::Array<Vec<f32>>>,
+    trig_tx: crossfire::MTx<crossfire::mpmc::Array<usize>>,
+}
+
+impl MixerOutput {
+    pub fn read_frames(&self, data: &mut [f32]) -> usize {
+        if let Err(_e) = self.trig_tx.send(data.len()) {
+            return 0; // 不应该
+        }
+        match self.output_rx.recv() {
+            Ok(x) => {
+                data.copy_from_slice(&x); // Mixer 应该负责
+                x.len()
+            }
+            Err(_e) => {
+                0 // 不应该
+            }
+        }
+    }
+}
 
 /// 音频轨道
 ///

@@ -17,7 +17,10 @@ use snafu::prelude::*;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::aud::dcblocker::DcBlocker;
+use crate::aud::{
+    dcblocker::DcBlocker,
+    mixer::{Mixer, MixerOutput},
+};
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
 
@@ -226,10 +229,10 @@ fn device_handler(
     let device = audio_host
         .device_by_id(dev_id)
         .context(DeviceUnavailableSnafu)?;
-    let desc = device.description().ok().context(DeviceUnavailableSnafu)?;
     ensure!(device.supports_output(), DeviceUnsupportedSnafu);
     debug!("device supports output.");
     // many device reported as Unknown
+    // let desc = device.description().ok().context(DeviceUnavailableSnafu)?;
     // ensure!(
     //     matches!(
     //         desc.device_type(),
@@ -264,6 +267,7 @@ fn device_handler(
         buffer_size: BufferSize::Fixed(256),
     };
     let device_wait_timeout = Duration::from_secs(1);
+    let (mixer, mixer_out) = Mixer::new(); // todo
     stream_handler(
         &dev_id.to_string(),
         device,
@@ -271,7 +275,7 @@ fn device_handler(
         device_wait_timeout,
         support_2ch,
         support_f32,
-        mixer,
+        mixer_out,
         ct,
     )
     .context(StreamSnafu)?;
@@ -286,11 +290,12 @@ fn stream_handler(
     device_wait_timeout: Duration,
     support_2ch: bool,
     support_f32: bool,
-    mixer: (),
+    mixer_out: MixerOutput,
     ct: CancellationToken,
 ) -> Result<(), StreamHandlerError> {
     loop {
         info!("Building output stream...");
+        let mo = mixer_out.clone();
         let err_cb = |err: cpal::Error| {};
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
@@ -304,7 +309,7 @@ fn stream_handler(
                         &mut temp_buf,
                         &mut dc_blocker,
                         support_2ch,
-                        mixer,
+                        &mo,
                     );
                 },
                 err_cb,
@@ -320,7 +325,7 @@ fn stream_handler(
                         &mut temp_buf,
                         &mut dc_blocker,
                         support_2ch,
-                        mixer,
+                        &mo,
                     );
                 },
                 err_cb,
@@ -371,14 +376,14 @@ fn stream_callback_convertor_f32(
     temp_buf: &mut Vec<f32>,
     dc_blocker: &mut DcBlocker,
     support_2ch: bool,
-    mixer: (),
+    mixer_out: &MixerOutput,
 ) -> () {
     if support_2ch {
-        stream_callback_handler(data, cbi, dc_blocker, mixer);
+        stream_callback_handler(data, cbi, dc_blocker, mixer_out);
     } else {
         let target_2ch_len = data.len() * 2;
         temp_buf.resize(target_2ch_len, 0.0);
-        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, dc_blocker, mixer);
+        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, dc_blocker, mixer_out);
         for (i, frame) in temp_buf.chunks_exact(2).enumerate() {
             data[i] = (frame[0] + frame[1]) * 0.5;
         }
@@ -391,19 +396,19 @@ fn stream_callback_convertor_i16(
     temp_buf: &mut Vec<f32>,
     dc_blocker: &mut DcBlocker,
     support_2ch: bool,
-    mixer: (),
+    mixer_out: &MixerOutput,
 ) -> () {
     if support_2ch {
         let target_len = data.len();
         temp_buf.resize(target_len, 0.0);
-        stream_callback_handler(&mut temp_buf[..target_len], cbi, dc_blocker, mixer);
+        stream_callback_handler(&mut temp_buf[..target_len], cbi, dc_blocker, mixer_out);
         for (out_sample, &in_sample) in data.iter_mut().zip(temp_buf.iter()) {
             *out_sample = f32_to_i16(in_sample);
         }
     } else {
         let target_2ch_len = data.len() * 2;
         temp_buf.resize(target_2ch_len, 0.0);
-        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, dc_blocker, mixer);
+        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, dc_blocker, mixer_out);
         for (i, frame) in temp_buf.chunks_exact(2).enumerate() {
             let mono_f32 = (frame[0] + frame[1]) * 0.5;
             data[i] = f32_to_i16(mono_f32);
@@ -416,9 +421,10 @@ fn stream_callback_handler(
     data: &mut [f32],
     cbi: &OutputCallbackInfo,
     dc_blocker: &mut DcBlocker,
-    mixer: (),
+    mixer_out: &MixerOutput,
 ) {
     cbi.timestamp();
+    mixer_out.read_frames(data);
     // last, pass the dc blocker
     dc_blocker.process_interleaved(data);
 }
