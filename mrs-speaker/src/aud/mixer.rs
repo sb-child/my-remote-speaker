@@ -98,7 +98,7 @@ fn mixer_worker(trig_rx: MixerTrigRx, ct: CancellationToken) {
         };
         if let Some(frame_tx) = r {
             let buf = mix_tracks(size);
-            frame_tx.send(buf); // need to handle if frame_rx droped?
+            frame_tx.send(buf); // 如果 frame_rx 被 drop，这里发送的 buf 会自动 drop。
         } else {
             seek_tracks(size);
         }
@@ -177,7 +177,8 @@ impl MixerOutput {
             .send_timeout((data.len(), Some(frame_tx)), time_left)
         {
             Err(SendTimeoutError::Timeout(_v)) => {
-                // trig_tx 积攒了一个 message。mixer_worker 最终会发现 frame_rx 已被 drop 所以没问题。
+                // trig channel 积攒了一个 message，刚发的 message 被退回。
+                // 上一个 message 的 frame_rx 已被 drop，让 worker 对它发送的内容被自动 drop 所以没问题。
                 return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
