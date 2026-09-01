@@ -66,7 +66,9 @@ impl MixerOutput {
         let request_instant = Instant::now();
         match self.trig_tx.send_timeout((data.len(), frame_tx), timeout) {
             Err(SendTimeoutError::Timeout(_v)) => {
-                return 0; // mixer_thread 超时
+                // 因为 mixer_thread 超时，trig_tx 积攒了一个 message。
+                // mixer_thread 最终会发现 frame_rx 已被 drop 所以没问题。
+                return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
                 self.errored.store(true, Ordering::Relaxed);

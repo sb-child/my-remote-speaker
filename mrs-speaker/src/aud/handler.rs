@@ -380,6 +380,7 @@ fn stream_callback_convertor_f32(
     mixer_out: &MixerOutput,
 ) -> () {
     if support_2ch {
+        // build_output_stream docs: The slice is pre-filled with silence.
         stream_callback_handler(data, cbi, dc_blocker, mixer_out);
     } else {
         let target_2ch_len = data.len() * 2;
