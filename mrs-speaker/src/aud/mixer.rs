@@ -117,10 +117,10 @@ impl MixerOutput {
 
     /// 在 stream 掉线时调用
     pub fn disconnected(&self) {
-        if self.disconnected.swap(true, Ordering::Relaxed) {
+        self.disconnect_at.store(Instant::now(), Ordering::Release);
+        if self.disconnected.swap(true, Ordering::Release) {
             return; // 只记录第一次断开连接时间
         }
-        self.disconnect_at.store(Instant::now(), Ordering::Relaxed);
     }
 
     pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
@@ -129,10 +129,10 @@ impl MixerOutput {
         if self.read_frames_errored.load(Ordering::Relaxed) {
             return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
         }
-        let trig_at = if self.disconnected.load(Ordering::Relaxed) {
+        let trig_at = if self.disconnected.load(Ordering::Acquire) {
             // 断开的时间
             let skip_at = Instant::now();
-            let dur = skip_at.duration_since(self.disconnect_at.load(Ordering::Relaxed));
+            let dur = skip_at.duration_since(self.disconnect_at.load(Ordering::Acquire));
             let skip_samples = (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
             // 快进 buffer
             match self.trig_tx.send_timeout((skip_samples, None), time_left) {
@@ -143,7 +143,7 @@ impl MixerOutput {
                     self.read_frames_errored.store(true, Ordering::Relaxed);
                     return 0;
                 }
-                _ => self.disconnected.store(false, Ordering::Relaxed),
+                _ => self.disconnected.store(false, Ordering::Release),
             }
             let trig_at = Instant::now();
             time_left = time_left.saturating_sub(trig_at.saturating_duration_since(skip_at));
