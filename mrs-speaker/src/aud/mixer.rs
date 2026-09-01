@@ -8,6 +8,12 @@ use std::sync::{
 /// 可以动态创建和删除混音器。
 pub struct Mixers {}
 
+pub enum MixerCmd {
+    AddTrack((Track, crossfire::Rx<crossfire::spsc::Array<u64>>)),
+    RemoveTrack((u64, crossfire::Rx<crossfire::spsc::Array<bool>>)),
+    InsertClip((u64, Clip, crossfire::Rx<crossfire::spsc::Array<bool>>)),
+}
+
 /// 混音器
 ///
 /// 可以挂载多个轨道，合并为一个输出。
@@ -28,6 +34,8 @@ impl Mixer {
 }
 
 fn mixer_thread() {}
+
+pub struct MixerHandle {}
 
 /// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
