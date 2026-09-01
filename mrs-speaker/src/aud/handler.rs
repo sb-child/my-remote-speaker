@@ -296,6 +296,7 @@ fn stream_handler(
     loop {
         info!("Building output stream...");
         let mo = mixer_out.clone();
+        mo.reset();
         let err_cb = |err: cpal::Error| {};
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
@@ -423,8 +424,10 @@ fn stream_callback_handler(
     dc_blocker: &mut DcBlocker,
     mixer_out: &MixerOutput,
 ) {
-    cbi.timestamp();
-    mixer_out.read_frames(data);
+    // read frames from mixer
+    let t = cbi.timestamp();
+    let read_timeout = t.playback - t.callback;
+    mixer_out.read_frames(data, read_timeout);
     // last, pass the dc blocker
     dc_blocker.process_interleaved(data);
 }

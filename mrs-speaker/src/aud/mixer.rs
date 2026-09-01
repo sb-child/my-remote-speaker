@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 /// 混音器管理器
@@ -21,19 +22,17 @@ pub enum MixerCmd {
 ///
 /// 可以挂载多个轨道，合并为一个输出。
 pub struct Mixer {
-    output_tx: crossfire::MTx<crossfire::mpmc::Array<Vec<f32>>>,
-    trig_rx: crossfire::MRx<crossfire::mpmc::Array<usize>>,
+    trig_rx:
+        crossfire::MRx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
 }
 
 impl Mixer {
     pub fn new() -> (Self, MixerOutput) {
-        let (output_tx, output_rx) = crossfire::mpmc::bounded_blocking(1);
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
         let out_errored = Default::default();
         (
-            Self { output_tx, trig_rx },
+            Self { trig_rx },
             MixerOutput {
-                output_rx,
                 trig_tx,
                 errored: out_errored,
             },
@@ -48,28 +47,46 @@ pub struct MixerHandle {}
 /// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
 pub struct MixerOutput {
-    output_rx: crossfire::MRx<crossfire::mpmc::Array<Vec<f32>>>,
-    trig_tx: crossfire::MTx<crossfire::mpmc::Array<usize>>,
+    trig_tx:
+        crossfire::MTx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
     errored: Arc<AtomicBool>,
 }
 
 impl MixerOutput {
-    pub fn read_frames(&self, data: &mut [f32]) -> usize {
+    pub fn reset(&self) {
+        self.errored.store(false, Ordering::Relaxed);
+    }
+
+    pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
         if self.errored.load(Ordering::Relaxed) {
             return 0; // 如果出现错误说明要么 mixer_thread 死了，要么并发读。
         }
-        if let Err(_e) = self.trig_tx.send(data.len()) {
-            self.errored.store(true, Ordering::Relaxed);
-            return 0; // 不应该
-        }
-        match self.output_rx.recv() {
-            Ok(x) => {
-                data.copy_from_slice(&x); // Mixer 应该负责
-                x.len()
+        // 开销是一次box堆分配
+        let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
+        let request_instant = Instant::now();
+        match self.trig_tx.send_timeout((data.len(), frame_tx), timeout) {
+            Err(SendTimeoutError::Timeout(_v)) => {
+                return 0; // mixer_thread 超时
             }
-            Err(_e) => {
+            Err(SendTimeoutError::Disconnected(_v)) => {
                 self.errored.store(true, Ordering::Relaxed);
-                0 // 不应该
+                return 0; // mixer_thread 死了
+            }
+            _ => (),
+        }
+        let response_timeout = timeout - (Instant::now() - request_instant);
+        match frame_rx.recv_timeout(response_timeout) {
+            Ok(x) => {
+                let n = x.len().min(data.len());
+                data[..n].copy_from_slice(&x[..n]);
+                n
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                0 // mixer_thread 响应超时
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.errored.store(true, Ordering::Relaxed);
+                0 // mixer_thread 死了
             }
         }
     }
@@ -197,6 +214,8 @@ pub struct ClipHandle {
 }
 
 use std::collections::VecDeque;
+
+use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
 
 pub struct ClipGroup {
     /// Clip 队列，第一个是正在播放的
