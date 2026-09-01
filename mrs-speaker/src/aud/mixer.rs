@@ -27,6 +27,8 @@ impl Mixer {
     }
 }
 
+fn mixer_thread() {}
+
 /// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
 pub struct MixerOutput {
