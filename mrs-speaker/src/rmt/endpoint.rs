@@ -7,7 +7,7 @@ use my_remote_speaker::{
         MrsRpcTrait, QuerySampleError, RemoveSampleError, SampleInfo, StoreSampleError,
         StoreSampleProgress, StoreSampleTaskState, TaskManageError,
     },
-    task::{TaskChannel, TaskId, TypedTaskState},
+    task::{ProgressChannel, TaskId, TypedTaskState},
 };
 use surrealkv::Tree;
 use tarpc::{
@@ -50,7 +50,7 @@ async fn store_audio_sample_task(
     ticket: BlobTicket,
     ep: Endpoint,
     ss: Tree,
-    stat: TaskChannel<StoreSampleProgress>,
+    stat: ProgressChannel<StoreSampleProgress>,
     _ct: CancellationToken,
 ) -> Result<(), StoreSampleError> {
     stat.update_async(StoreSampleProgress::CheckingDatabase)

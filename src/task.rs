@@ -138,7 +138,7 @@ pub enum TypedTaskState<P, T, E> {
     Cancelled,
 }
 
-pub struct TaskChannel<P>
+pub struct ProgressChannel<P>
 where
     P: Send + Sync + 'static + Unpin,
 {
@@ -146,7 +146,7 @@ where
     matx: crossfire::MAsyncTx<crossfire::mpsc::Array<P>>,
 }
 
-impl<P> TaskChannel<P>
+impl<P> ProgressChannel<P>
 where
     P: Send + Sync + 'static + Unpin,
 {
@@ -220,7 +220,7 @@ impl TaskManager {
 
     pub fn spawn_typed<F, Fut, P, T, E>(&self, f: F) -> TaskHandle<P, T, E>
     where
-        F: FnOnce(TaskChannel<P>, CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(ProgressChannel<P>, CancellationToken) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
         P: Send + Sync + 'static + Unpin,
         T: Send + Sync + 'static,
@@ -232,7 +232,7 @@ impl TaskManager {
 
     pub fn spawn_blocking_typed<F, P, T, E>(&self, f: F) -> TaskHandle<P, T, E>
     where
-        F: FnOnce(TaskChannel<P>, CancellationToken) -> Result<T, E> + Send + 'static,
+        F: FnOnce(ProgressChannel<P>, CancellationToken) -> Result<T, E> + Send + 'static,
         P: Send + Sync + 'static + Unpin,
         T: Send + Sync + 'static,
         E: Send + Sync + 'static,
@@ -243,7 +243,7 @@ impl TaskManager {
 
     pub fn spawn<F, Fut, P, T, E>(&self, f: F) -> TaskId
     where
-        F: FnOnce(TaskChannel<P>, CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(ProgressChannel<P>, CancellationToken) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
         P: Send + Sync + 'static + Unpin,
         T: Send + Sync + 'static,
@@ -261,7 +261,7 @@ impl TaskManager {
         }
         let token = CancellationToken::new();
         let task_token = token.clone();
-        let (status_tx, status_rx) = TaskChannel::new();
+        let (status_tx, status_rx) = ProgressChannel::new();
         self.tasks.insert(task_id, TaskState::Pending);
         let tasks_for_progress = Arc::clone(&self.tasks);
         let tasks_for_result = Arc::clone(&self.tasks);
@@ -311,7 +311,7 @@ impl TaskManager {
 
     pub fn spawn_blocking<F, P, T, E>(&self, f: F) -> TaskId
     where
-        F: FnOnce(TaskChannel<P>, CancellationToken) -> Result<T, E> + Send + 'static,
+        F: FnOnce(ProgressChannel<P>, CancellationToken) -> Result<T, E> + Send + 'static,
         P: Send + Sync + 'static + Unpin,
         T: Send + Sync + 'static,
         E: Send + Sync + 'static,
@@ -328,7 +328,7 @@ impl TaskManager {
         }
         let token = CancellationToken::new();
         let task_token = token.clone();
-        let (status_tx, status_rx) = TaskChannel::new();
+        let (status_tx, status_rx) = ProgressChannel::new();
         self.tasks.insert(task_id, TaskState::Pending);
         let tasks_for_progress = Arc::clone(&self.tasks);
         let tasks_for_result = Arc::clone(&self.tasks);

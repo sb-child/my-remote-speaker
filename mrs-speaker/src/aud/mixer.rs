@@ -21,16 +21,20 @@ pub enum MixerCmd {
 ///
 /// 可以挂载多个轨道，合并为一个输出。
 pub struct Mixer {
-    trig_rx:
-        crossfire::MRx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
+    worker_handle: TaskHandle<(), (), ()>,
 }
 
 impl Mixer {
-    pub fn new() -> (Self, MixerOutput) {
+    pub fn new(tm: &TaskManager) -> (Self, MixerOutput) {
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
+        let worker_handle: TaskHandle<(), (), ()> = tm.spawn_blocking_typed(|pc, ct| {
+            pc.update(()).ok();
+            mixer_worker(trig_rx, ct);
+            Ok(())
+        });
         let out_errored = Default::default();
         (
-            Self { trig_rx },
+            Self { worker_handle },
             MixerOutput {
                 trig_tx,
                 errored: out_errored,
@@ -39,7 +43,13 @@ impl Mixer {
     }
 }
 
-fn mixer_thread() {}
+fn mixer_worker(
+    trig_rx: crossfire::MRx<
+        crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>,
+    >,
+    ct: CancellationToken,
+) {
+}
 
 pub struct MixerHandle {}
 
@@ -58,20 +68,20 @@ impl MixerOutput {
 
     pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
         if self.errored.load(Ordering::Relaxed) {
-            return 0; // 如果出现错误说明要么 mixer_thread 死了，要么并发读。
+            return 0; // 如果出现错误说明要么 mixer_worker 死了，要么并发读。
         }
         // 开销是一次box堆分配
         let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
         let request_instant = Instant::now();
         match self.trig_tx.send_timeout((data.len(), frame_tx), timeout) {
             Err(SendTimeoutError::Timeout(_v)) => {
-                // 因为 mixer_thread 超时，trig_tx 积攒了一个 message。
-                // mixer_thread 最终会发现 frame_rx 已被 drop 所以没问题。
+                // 因为 mixer_worker 超时，trig_tx 积攒了一个 message。
+                // mixer_worker 最终会发现 frame_rx 已被 drop 所以没问题。
                 return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
                 self.errored.store(true, Ordering::Relaxed);
-                return 0; // mixer_thread 死了
+                return 0; // mixer_worker 死了
             }
             _ => (),
         }
@@ -218,6 +228,8 @@ pub struct ClipHandle {
 use std::collections::VecDeque;
 
 use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
+use my_remote_speaker::task::{TaskHandle, TaskManager};
+use tokio_util::sync::CancellationToken;
 
 pub struct ClipGroup {
     /// Clip 队列，第一个是正在播放的

@@ -32,9 +32,10 @@ fn on_device_add(
     tm: &TaskManager,
 ) {
     let dev_id_2 = dev_id.clone();
+    let tm2 = tm.clone();
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()).ok(); // todo
-        device_handler(&dev_id_str, &dev_id_2, (), ct)
+        device_handler(&dev_id_str, &dev_id_2, (), ct, &tm2)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task started. Cancelling old task.");
@@ -78,9 +79,10 @@ fn on_device_online(
         }
     }
     let dev_id_2 = dev_id.clone();
+    let tm2 = tm.clone();
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()).ok(); // todo
-        device_handler(&dev_id_str, &dev_id_2, (), ct)
+        device_handler(&dev_id_str, &dev_id_2, (), ct, &tm2)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task restarted. Cancelling old task.");
@@ -223,6 +225,7 @@ fn device_handler(
     dev_id: &cpal::DeviceId,
     mixer: (),
     ct: CancellationToken,
+    tm: &TaskManager, // todo，taskmanager只是给mixer用的
 ) -> Result<(), DeviceHandlerError> {
     info!("Init device...");
     let audio_host = cpal::default_host();
@@ -267,7 +270,7 @@ fn device_handler(
         buffer_size: BufferSize::Fixed(256),
     };
     let device_wait_timeout = Duration::from_secs(1);
-    let (mixer, mixer_out) = Mixer::new(); // todo
+    let (mixer, mixer_out) = Mixer::new(tm); // todo，之后会移走
     stream_handler(
         &dev_id.to_string(),
         device,
