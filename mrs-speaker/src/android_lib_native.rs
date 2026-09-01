@@ -17,13 +17,14 @@ use jni::{
     strings::JNIString,
 };
 use my_remote_speaker::clock::AccurateClock;
+use my_remote_speaker::task::TaskManager;
 use std::error::Error;
 #[cfg(feature = "android")]
 use std::ffi::c_void;
 use std::time::Duration;
 use std::{fs, path::PathBuf};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, instrument};
 
 #[cfg(feature = "android")]
 pub fn entrypoint(
@@ -191,10 +192,9 @@ async fn daemon_app(
     smcs: SampleCacheService,
     stop_file: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
+    let tm = TaskManager::new();
     let ct = CancellationToken::new();
-    if let Some(sf) = stop_file {
-        tokio::spawn(stop_file_handler(sf, ct.clone()));
-    }
+    // start accurate clock
     let clock = AccurateClock::new();
     let c = clock.clone();
     let clock_wait_sync_handle = tokio::spawn(async move {
@@ -203,20 +203,28 @@ async fn daemon_app(
         let now_local = chrono::Utc::now();
         info!("Clock: now_ntp: {}, now_local: {}", now_ntp, now_local);
     });
+    // shutdown handling
+    if let Some(sf) = stop_file {
+        tokio::spawn(stop_file_handler(sf.display().to_string(), sf, ct.clone()));
+    }
     let ct2 = ct.clone();
+    let tm2 = tm.clone();
     let c = clock.clone();
     tokio::spawn(async move {
         ct2.cancelled().await;
+        tm2.close();
         clock_wait_sync_handle.abort();
         clock_wait_sync_handle.await.ok();
         c.close().await;
     });
-    rmt::bind_endpoint(kps, smps, smcs, ct).await?;
+    // start modules
+    rmt::bind_endpoint(tm, kps, smps, smcs, ct).await?;
     Ok(())
 }
 
-async fn stop_file_handler(stop_file: PathBuf, cancel_token: CancellationToken) {
-    info!("Listening to {}", stop_file.display());
+#[instrument(skip_all, fields(f = _f))]
+async fn stop_file_handler(_f: String, stop_file: PathBuf, cancel_token: CancellationToken) {
+    info!("Listening.");
     let mut check_interval = tokio::time::interval(tokio::time::Duration::from_millis(200));
     loop {
         tokio::select! {
@@ -225,7 +233,7 @@ async fn stop_file_handler(stop_file: PathBuf, cancel_token: CancellationToken) 
             }
             _ = check_interval.tick() => {
                 if tokio::fs::try_exists(&stop_file).await.unwrap_or(false) {
-                    info!("File {} Created. Cancelling tasks.", stop_file.display());
+                    info!("File Created. Cancelling tasks.");
                     cancel_token.cancel();
                     break;
                 }

@@ -18,6 +18,7 @@ pub mod sample_cache;
 pub mod sample_store;
 
 pub async fn bind_endpoint(
+    task_manager: TaskManager,
     kps: KeypairService,
     smps: SampleStoreService,
     smcs: SampleCacheService,
@@ -26,7 +27,6 @@ pub async fn bind_endpoint(
     let secret_key = tokio::task::spawn_blocking(move || kps.read_secret_key()).await??;
     let sample_store = smps.open().await?;
     let sample_cache = smcs.open().await?;
-    let task_manager = TaskManager::new();
     let ep = iroh::Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .address_lookup(DhtAddressLookup::builder())
@@ -44,18 +44,12 @@ pub async fn bind_endpoint(
         .accept(mrs_rpc_alpn, RpcEp { ctx: ctx.clone() })
         .spawn();
     tokio::select! {
-        _ = cancel_token.cancelled() => stop_all_things(router, ep, sample_store, sample_cache, task_manager).await
+        _ = cancel_token.cancelled() => stop_all_things(router, ep, sample_store, sample_cache).await
     }
     Ok(())
 }
 
-async fn stop_all_things(
-    router: Router,
-    ep: Endpoint,
-    sample_store: Tree,
-    sample_cache: Tree,
-    task_manager: TaskManager,
-) {
+async fn stop_all_things(router: Router, ep: Endpoint, sample_store: Tree, sample_cache: Tree) {
     info!("Stopping bind_endpoint task");
     if let Err(e) = router.shutdown().await {
         warn!("Error while stopping iroh router: {}", e);
@@ -74,8 +68,6 @@ async fn stop_all_things(
     } else {
         info!("Stopped sample_cache database");
     }
-    task_manager.close();
-    info!("Stopped task_manager database");
 }
 
 #[derive(Clone)]
