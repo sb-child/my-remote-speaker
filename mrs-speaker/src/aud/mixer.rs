@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    default::Default,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// 混音器管理器
@@ -26,9 +29,14 @@ impl Mixer {
     pub fn new() -> (Self, MixerOutput) {
         let (output_tx, output_rx) = crossfire::mpmc::bounded_blocking(1);
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
+        let out_errored = Default::default();
         (
             Self { output_tx, trig_rx },
-            MixerOutput { output_rx, trig_tx },
+            MixerOutput {
+                output_rx,
+                trig_tx,
+                errored: out_errored,
+            },
         )
     }
 }
@@ -42,11 +50,16 @@ pub struct MixerHandle {}
 pub struct MixerOutput {
     output_rx: crossfire::MRx<crossfire::mpmc::Array<Vec<f32>>>,
     trig_tx: crossfire::MTx<crossfire::mpmc::Array<usize>>,
+    errored: Arc<AtomicBool>,
 }
 
 impl MixerOutput {
     pub fn read_frames(&self, data: &mut [f32]) -> usize {
+        if self.errored.load(Ordering::Relaxed) {
+            return 0; // 如果出现错误说明要么 mixer_thread 死了，要么并发读。
+        }
         if let Err(_e) = self.trig_tx.send(data.len()) {
+            self.errored.store(true, Ordering::Relaxed);
             return 0; // 不应该
         }
         match self.output_rx.recv() {
@@ -55,6 +68,7 @@ impl MixerOutput {
                 x.len()
             }
             Err(_e) => {
+                self.errored.store(true, Ordering::Relaxed);
                 0 // 不应该
             }
         }
