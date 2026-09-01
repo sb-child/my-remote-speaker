@@ -140,7 +140,7 @@ impl MixerOutput {
                     return 0;
                 }
                 Err(SendTimeoutError::Disconnected(_v)) => {
-                    self.read_frames_errored.store(true, Ordering::Relaxed);
+                    self.read_frames_errored.store(true, Ordering::Release);
                     return 0;
                 }
                 _ => self.disconnected.store(false, Ordering::Release),
