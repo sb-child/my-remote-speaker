@@ -1,11 +1,19 @@
+use crate::aud::SAMPLE_RATE;
+use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
+use my_remote_speaker::{
+    task::{TaskHandle, TaskManager},
+    util::AtomicInstant,
+};
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 /// 混音器管理器
 ///
@@ -76,7 +84,7 @@ fn spawn_mixer_worker(tm: &TaskManager, trig_rx: MixerTrigRx) -> TaskHandle<(), 
 
 fn mixer_worker(trig_rx: MixerTrigRx, ct: CancellationToken) {
     loop {
-        let (size, frame_tx) = match trig_rx.recv_timeout(Duration::from_millis(50)) {
+        let (size, r) = match trig_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(x) => x,
             Err(RecvTimeoutError::Timeout) => {
                 if ct.is_cancelled() {
@@ -88,13 +96,23 @@ fn mixer_worker(trig_rx: MixerTrigRx, ct: CancellationToken) {
                 return;
             }
         };
-        if let Some(frame_tx) = frame_tx {
-            // fill frames
+        if let Some(frame_tx) = r {
+            let buf = mix_tracks(size);
+            frame_tx.send(buf); // need to handle if frame_rx droped?
         } else {
-            // seek position
+            seek_tracks(size);
         }
-        // todo
     }
+}
+
+fn mix_tracks(items: usize) -> Vec<f32> {
+    let buf = Vec::new();
+    // todo: mix tracks
+    buf
+}
+
+fn seek_tracks(items: usize) {
+    // todo
 }
 
 pub struct MixerHandle {}
@@ -209,8 +227,21 @@ impl Track {
     }
 
     pub fn skip_frames(&mut self, items: usize) -> usize {
-        // todo
-        0
+        let mut remaining = items;
+        while remaining > 0 {
+            if self.current_clip.is_none() && !self.try_fetch_next_clip() {
+                break;
+            }
+            if let Some((clip, pos)) = self.current_clip.as_mut() {
+                let n = clip.skip_items(remaining);
+                *pos += n;
+                remaining -= n;
+                if n == 0 {
+                    self.current_clip = None;
+                }
+            }
+        }
+        items - remaining
     }
 
     /// 读取音频轨道，填充 data。返回成功填充的元素数。
@@ -309,7 +340,7 @@ impl Clip {
         self.sample.len()
     }
 
-    pub(crate) fn is_timeout(&self) -> bool {
+    pub(crate) fn timed_out(&self) -> bool {
         self.timeout.load(Ordering::Relaxed)
     }
 }
@@ -319,17 +350,6 @@ pub struct ClipHandle {
     timeout: Arc<AtomicBool>,
     done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
 }
-
-use std::collections::VecDeque;
-
-use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
-use my_remote_speaker::{
-    task::{TaskHandle, TaskManager, TypedTaskState},
-    util::AtomicInstant,
-};
-use tokio_util::sync::CancellationToken;
-
-use crate::aud::SAMPLE_RATE;
 
 pub struct ClipGroup {
     /// Clip 队列，第一个是正在播放的
@@ -369,6 +389,37 @@ impl ClipGroup {
         )
     }
 
+    pub fn skip_items(&mut self, mut items: usize) -> usize {
+        let mut skipped = 0;
+        while items > 0 {
+            while self.clips.front().map_or(false, |c| c.timed_out()) {
+                self.clips.pop_front();
+                self.clip_pos = 0;
+            }
+            let Some(clip) = self.clips.front_mut() else {
+                break;
+            };
+            let clip_remaining = clip.size() - self.clip_pos;
+            if clip_remaining == 0 {
+                self.clips.pop_front();
+                self.clip_pos = 0;
+                continue;
+            }
+            if items >= clip_remaining {
+                items -= clip_remaining;
+                skipped += clip_remaining;
+                self.clips.pop_front();
+                self.clip_pos = 0;
+            } else {
+                self.clip_pos += items;
+                skipped += items;
+                items = 0;
+            }
+        }
+        self.pos += skipped;
+        skipped
+    }
+
     pub fn read_frames(&mut self, start_idx: usize, data: &mut [f32]) -> usize {
         if self.skip.load(Ordering::Relaxed) {
             return 0;
@@ -376,7 +427,7 @@ impl ClipGroup {
         debug_assert_eq!(start_idx, self.pos, "read backward is unsupported");
         let mut written = 0; // 本次读出的数据量
         while written < data.len() {
-            while self.clips.front().map_or(false, |c| c.is_timeout()) {
+            while self.clips.front().map_or(false, |c| c.timed_out()) {
                 self.clips.pop_front(); // 跳过已超时的 Clip
                 self.clip_pos = 0;
             }
