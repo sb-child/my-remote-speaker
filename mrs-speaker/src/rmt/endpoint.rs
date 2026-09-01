@@ -135,9 +135,9 @@ impl MrsRpcTrait for RpcEp {
                 TypedTaskState::Failed(err) => {
                     Ok(StoreSampleTaskState::Failed(err.as_ref().clone()))
                 }
-                TypedTaskState::Cancelling | TypedTaskState::Cancelled => {
-                    Err(TaskManageError::NotFound)
-                }
+                TypedTaskState::Panicked(_)
+                | TypedTaskState::Cancelling
+                | TypedTaskState::Cancelled => Err(TaskManageError::NotFound),
             }
         } else {
             Err(TaskManageError::NotFound)

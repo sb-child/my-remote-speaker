@@ -16,6 +16,16 @@ use tokio_util::sync::CancellationToken;
 
 pub type TaskId = u64;
 
+fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "Task panicked with unknown payload".to_string()
+    }
+}
+
 #[derive(Clone)]
 pub enum TaskState {
     Pending,
@@ -24,6 +34,7 @@ pub enum TaskState {
     Completed(Arc<dyn Any + Send + Sync>),
     Failed(Arc<dyn Any + Send + Sync>),
     Cancelled,
+    Panicked(Arc<String>),
 }
 
 impl TaskState {
@@ -45,9 +56,15 @@ impl TaskState {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
+    pub fn is_panicked(&self) -> bool {
+        matches!(self, Self::Panicked(_))
+    }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed(_) | Self::Failed(_) | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed(_) | Self::Failed(_) | Self::Cancelled | Self::Panicked(_)
+        )
     }
 
     pub fn downcast_running<P: 'static + Sync + Send>(&self) -> Option<Arc<P>> {
@@ -74,6 +91,14 @@ impl TaskState {
         }
     }
 
+    pub fn panicked_message(&self) -> Option<Arc<String>> {
+        if let TaskState::Panicked(msg) = self {
+            Some(msg.clone())
+        } else {
+            None
+        }
+    }
+
     pub fn into_result<T, E>(&self) -> Option<Result<Arc<T>, TaskError<E>>>
     where
         T: 'static + Send + Sync,
@@ -87,6 +112,7 @@ impl TaskState {
                 .ok()
                 .map(|e| Err(TaskError::Failed(e))),
             TaskState::Cancelled => Some(Err(TaskError::Cancelled)),
+            TaskState::Panicked(msg) => Some(Err(TaskError::Panicked(msg.clone()))),
             _ => None,
         }
     }
@@ -101,6 +127,7 @@ impl TaskState {
             TaskState::Pending => TypedTaskState::Pending,
             TaskState::Cancelling => TypedTaskState::Cancelling,
             TaskState::Cancelled => TypedTaskState::Cancelled,
+            TaskState::Panicked(msg) => TypedTaskState::Panicked(msg.clone()),
             TaskState::Running(v) => v
                 .clone()
                 .downcast::<P>()
@@ -120,6 +147,7 @@ impl TaskState {
 pub enum TaskError<E> {
     Failed(Arc<E>),
     Cancelled,
+    Panicked(Arc<String>),
 }
 
 impl fmt::Debug for TaskState {
@@ -131,6 +159,7 @@ impl fmt::Debug for TaskState {
             TaskState::Completed(_) => write!(f, "TaskState::Completed"),
             TaskState::Failed(_) => write!(f, "TaskState::Failed"),
             TaskState::Cancelled => write!(f, "TaskState::Cancelled"),
+            TaskState::Panicked(_) => write!(f, "TaskState::Panicked"),
         }
     }
 }
@@ -143,6 +172,7 @@ pub enum TypedTaskState<P, T, E> {
     Completed(Arc<T>),
     Failed(Arc<E>),
     Cancelled,
+    Panicked(Arc<String>),
 }
 
 impl<P, T, E> TypedTaskState<P, T, E> {
@@ -164,9 +194,15 @@ impl<P, T, E> TypedTaskState<P, T, E> {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
+    pub fn is_panicked(&self) -> bool {
+        matches!(self, Self::Panicked(_))
+    }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed(_) | Self::Failed(_) | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed(_) | Self::Failed(_) | Self::Cancelled | Self::Panicked(_)
+        )
     }
 }
 
@@ -229,7 +265,9 @@ impl Drop for TaskGuard {
             if !is_handled {
                 self.tasks.insert(
                     self.task_id,
-                    TaskState::Failed(Arc::new("Task executed with panic or aborted".to_string())),
+                    TaskState::Panicked(Arc::new(
+                        "Task executed with panic or aborted".to_string(),
+                    )),
                 );
             }
             if !is_cancelling {
@@ -341,13 +379,9 @@ impl TaskManager {
                     Ok(Err(err)) => {
                         tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
                     }
-                    Err(_panic) => {
-                        tasks_for_result.insert(
-                            task_id,
-                            TaskState::Failed(Arc::new(
-                                "Task panicked during execution".to_string(),
-                            )),
-                        );
+                    Err(panic) => {
+                        let msg = panic_payload_to_string(panic.as_ref());
+                        tasks_for_result.insert(task_id, TaskState::Panicked(Arc::new(msg)));
                     }
                 }
             }
@@ -422,13 +456,12 @@ impl TaskManager {
                     Ok(Err(err)) => {
                         tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
                     }
-                    Err(_panic) => {
-                        tasks_for_result.insert(
-                            task_id,
-                            TaskState::Failed(Arc::new(
-                                "Task panicked during execution".to_string(),
-                            )),
-                        );
+                    Err(join_err) => {
+                        let msg = match join_err.try_into_panic() {
+                            Ok(panic_err) => panic_payload_to_string(panic_err.as_ref()),
+                            Err(_join_err) => "Task was cancelled or aborted".to_string(),
+                        };
+                        tasks_for_result.insert(task_id, TaskState::Panicked(Arc::new(msg)));
                     }
                 }
             }
@@ -472,7 +505,7 @@ impl TaskManager {
                 let graceful_exit =
                     tokio::time::timeout(Duration::from_secs(5), &mut death_rx.recv()).await;
                 if graceful_exit.is_err() {
-                    handle.abort();
+                    handle.abort(); // async task only
                     // 如果task还没死就一直等着
                     let _ = death_rx.recv().await;
                     let _ = handle.await;

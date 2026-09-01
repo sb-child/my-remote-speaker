@@ -48,13 +48,10 @@ impl Mixer {
             w.cancel(); // worker 不会立刻关闭
             loop {
                 thread::sleep(Duration::from_millis(100));
-                if let Some(
-                    TypedTaskState::Cancelled
-                    | TypedTaskState::Completed(_)
-                    | TypedTaskState::Failed(_),
-                ) = w.status()
-                {
-                    break;
+                if let Some(ts) = w.status() {
+                    if ts.is_terminal() {
+                        break;
+                    }
                 }
             }
         }
