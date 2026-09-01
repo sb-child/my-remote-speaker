@@ -433,16 +433,14 @@ impl TaskManager {
         } else {
             return;
         }
-        if let Some((_, (handle, token))) = self.handles.remove(&task_id) {
+        if let Some((_, (mut handle, token))) = self.handles.remove(&task_id) {
             token.cancel();
             let tasks = Arc::clone(&self.tasks);
             tokio::spawn(async move {
-                let mut handle = handle;
-                tokio::select! {
-                    _ = &mut handle => {}
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                        handle.abort();
-                    }
+                let graceful_exit = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+                if graceful_exit.is_err() {
+                    handle.abort();
+                    let _ = handle.await; // 如果task还没死就一直等着
                 }
                 if let Some(mut state) = tasks.get_mut(&task_id) {
                     *state = TaskState::Cancelled;
