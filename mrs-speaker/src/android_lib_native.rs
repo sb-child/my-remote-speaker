@@ -214,7 +214,6 @@ async fn daemon_app(
         ct2.cancelled().await;
         tm2.close();
         clock_wait_sync_handle.abort();
-        clock_wait_sync_handle.await.ok();
         c.close().await;
     });
     // start modules
