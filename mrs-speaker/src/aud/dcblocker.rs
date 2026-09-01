@@ -3,6 +3,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use crate::aud::SAMPLE_RATE;
+
 #[derive(Debug, Clone)]
 pub struct DcBlocker {
     r: f32,
@@ -42,7 +44,7 @@ impl DcBlocker {
     }
 
     pub fn default_48k() -> (Self, DcBlockerHandle) {
-        Self::new(10.0, 48000.0)
+        Self::new(10.0, SAMPLE_RATE as f32)
     }
 
     #[inline(always)]

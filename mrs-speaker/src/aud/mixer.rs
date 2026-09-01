@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -38,7 +38,9 @@ impl Mixer {
             },
             MixerOutput {
                 trig_tx,
-                errored: Default::default(),
+                read_frames_errored: Default::default(),
+                disconnected: Default::default(),
+                disconnect_at: AtomicInstant::new(Instant::now()).into(),
             },
         )
     }
@@ -104,28 +106,44 @@ pub struct MixerHandle {}
 pub struct MixerOutput {
     trig_tx:
         crossfire::MTx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
-    errored: Arc<AtomicBool>,
+    read_frames_errored: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_at: Arc<AtomicInstant>,
 }
 
 impl MixerOutput {
     pub fn reset(&self) {
-        self.errored.store(false, Ordering::Relaxed);
+        self.read_frames_errored.store(false, Ordering::Relaxed);
+    }
+
+    /// 在 stream 掉线时调用
+    pub fn disconnected(&self) {
+        if self.disconnected.swap(true, Ordering::Relaxed) {
+            return; // 只记录第一次断开连接时间
+        }
+        self.disconnect_at.store(Instant::now(), Ordering::Relaxed);
     }
 
     pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
-        if self.errored.load(Ordering::Relaxed) {
+        if self.read_frames_errored.load(Ordering::Relaxed) {
             return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
+        }
+        let request_instant = Instant::now();
+        if self.disconnected.swap(false, Ordering::Relaxed) {
+            // 断开的时间
+            let dur = request_instant.duration_since(self.disconnect_at.load(Ordering::Relaxed));
+            let skip_samples = (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
+            // todo: 快进 buffer
         }
         // 开销是一次box堆分配
         let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
-        let request_instant = Instant::now();
         match self.trig_tx.send_timeout((data.len(), frame_tx), timeout) {
             Err(SendTimeoutError::Timeout(_v)) => {
                 // trig_tx 积攒了一个 message。mixer_worker 最终会发现 frame_rx 已被 drop 所以没问题。
                 return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
-                self.errored.store(true, Ordering::Relaxed);
+                self.read_frames_errored.store(true, Ordering::Relaxed);
                 return 0; // mixer 死了
             }
             _ => (),
@@ -142,7 +160,7 @@ impl MixerOutput {
                 0 // mixer_worker 响应超时
             }
             Err(RecvTimeoutError::Disconnected) => {
-                self.errored.store(true, Ordering::Relaxed);
+                self.read_frames_errored.store(true, Ordering::Relaxed);
                 0 // mixer 死了
             }
         }
@@ -273,8 +291,13 @@ pub struct ClipHandle {
 use std::collections::VecDeque;
 
 use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
-use my_remote_speaker::task::{TaskHandle, TaskManager, TypedTaskState};
+use my_remote_speaker::{
+    task::{TaskHandle, TaskManager, TypedTaskState},
+    util::AtomicInstant,
+};
 use tokio_util::sync::CancellationToken;
+
+use crate::aud::SAMPLE_RATE;
 
 pub struct ClipGroup {
     /// Clip 队列，第一个是正在播放的

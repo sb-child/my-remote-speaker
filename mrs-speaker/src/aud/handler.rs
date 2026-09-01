@@ -18,8 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::aud::{
-    dcblocker::DcBlocker,
-    mixer::{Mixer, MixerOutput},
+    SAMPLE_RATE, dcblocker::DcBlocker, mixer::{Mixer, MixerOutput},
 };
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
@@ -264,16 +263,15 @@ fn device_handler(
         .ok()
         .context(DeviceUnsupportedSnafu)?;
     debug!("got supported_output_configs.");
-    let sample_rate = 48000;
     let (support_f32, support_2ch) =
-        get_supported_config(soc, sample_rate).context(DeviceUnsupportedSnafu)?;
+        get_supported_config(soc, SAMPLE_RATE).context(DeviceUnsupportedSnafu)?;
     debug!(
         "config: support_f32={}, support_2ch={}",
         support_f32, support_2ch
     );
     let stream_config = StreamConfig {
         channels: if support_2ch { 2 } else { 1 },
-        sample_rate: sample_rate,
+        sample_rate: SAMPLE_RATE,
         // no guarantees can be made about the actual callback size
         buffer_size: BufferSize::Fixed(256),
     };

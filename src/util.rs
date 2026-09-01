@@ -1,3 +1,8 @@
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
+
 pub trait MultiFind<Item> {
     type Output;
     fn init() -> (Self::Output, usize);
@@ -50,3 +55,31 @@ pub trait IteratorExt: Iterator + Sized {
 }
 
 impl<I: Iterator> IteratorExt for I {}
+
+pub struct AtomicInstant {
+    anchor: Instant,
+    offset_ns: AtomicU64,
+}
+
+impl AtomicInstant {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            anchor: now,
+            offset_ns: AtomicU64::new(0),
+        }
+    }
+
+    pub fn store(&self, instant: Instant, order: Ordering) {
+        if instant >= self.anchor {
+            let duration = instant.duration_since(self.anchor);
+            self.offset_ns.store(duration.as_nanos() as u64, order);
+        } else {
+            self.offset_ns.store(0, order);
+        }
+    }
+
+    pub fn load(&self, order: Ordering) -> Instant {
+        let ns = self.offset_ns.load(order);
+        self.anchor + Duration::from_nanos(ns)
+    }
+}
