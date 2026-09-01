@@ -18,12 +18,15 @@ pub enum MixerCmd {
     InsertClip((u64, ClipGroup, crossfire::Rx<crossfire::spsc::Array<bool>>)),
 }
 
+type MixerTrigRx = crossfire::MRx<
+    crossfire::mpmc::Array<(usize, Option<crossfire::oneshot::TxOneshot<Vec<f32>>>)>,
+>;
+
 /// 混音器
 ///
 /// 可以挂载多个轨道，合并为一个输出。
 pub struct Mixer {
-    trig_rx:
-        crossfire::MRx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
+    trig_rx: MixerTrigRx,
     worker: Option<TaskHandle<(), (), ()>>,
 }
 
@@ -63,12 +66,7 @@ impl Mixer {
     }
 }
 
-fn spawn_mixer_worker(
-    tm: &TaskManager,
-    trig_rx: crossfire::MRx<
-        crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>,
-    >,
-) -> TaskHandle<(), (), ()> {
+fn spawn_mixer_worker(tm: &TaskManager, trig_rx: MixerTrigRx) -> TaskHandle<(), (), ()> {
     tm.spawn_blocking_typed(move |pc, ct| {
         pc.update(()).ok();
         mixer_worker(trig_rx, ct);
@@ -76,12 +74,7 @@ fn spawn_mixer_worker(
     })
 }
 
-fn mixer_worker(
-    trig_rx: crossfire::MRx<
-        crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>,
-    >,
-    ct: CancellationToken,
-) {
+fn mixer_worker(trig_rx: MixerTrigRx, ct: CancellationToken) {
     loop {
         let (size, frame_tx) = match trig_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(x) => x,
@@ -95,6 +88,11 @@ fn mixer_worker(
                 return;
             }
         };
+        if let Some(frame_tx) = frame_tx {
+            // fill frames
+        } else {
+            // seek position
+        }
         // todo
     }
 }
@@ -104,8 +102,9 @@ pub struct MixerHandle {}
 /// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
 pub struct MixerOutput {
-    trig_tx:
-        crossfire::MTx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
+    trig_tx: crossfire::MTx<
+        crossfire::mpmc::Array<(usize, Option<crossfire::oneshot::TxOneshot<Vec<f32>>>)>,
+    >,
     read_frames_errored: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
     disconnect_at: Arc<AtomicInstant>,
@@ -125,19 +124,39 @@ impl MixerOutput {
     }
 
     pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
+        let mut time_left = timeout;
+        // let mut start_at = Instant::now();
         if self.read_frames_errored.load(Ordering::Relaxed) {
             return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
         }
-        let request_instant = Instant::now();
-        if self.disconnected.swap(false, Ordering::Relaxed) {
+        let trig_at = if self.disconnected.load(Ordering::Relaxed) {
             // 断开的时间
-            let dur = request_instant.duration_since(self.disconnect_at.load(Ordering::Relaxed));
+            let skip_at = Instant::now();
+            let dur = skip_at.duration_since(self.disconnect_at.load(Ordering::Relaxed));
             let skip_samples = (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
-            // todo: 快进 buffer
-        }
+            // 快进 buffer
+            match self.trig_tx.send_timeout((skip_samples, None), time_left) {
+                Err(SendTimeoutError::Timeout(_v)) => {
+                    return 0;
+                }
+                Err(SendTimeoutError::Disconnected(_v)) => {
+                    self.read_frames_errored.store(true, Ordering::Relaxed);
+                    return 0;
+                }
+                _ => self.disconnected.store(false, Ordering::Relaxed),
+            }
+            let trig_at = Instant::now();
+            time_left = time_left.saturating_sub(trig_at.saturating_duration_since(skip_at));
+            trig_at
+        } else {
+            Instant::now()
+        };
         // 开销是一次box堆分配
         let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
-        match self.trig_tx.send_timeout((data.len(), frame_tx), timeout) {
+        match self
+            .trig_tx
+            .send_timeout((data.len(), Some(frame_tx)), time_left)
+        {
             Err(SendTimeoutError::Timeout(_v)) => {
                 // trig_tx 积攒了一个 message。mixer_worker 最终会发现 frame_rx 已被 drop 所以没问题。
                 return 0;
@@ -148,9 +167,9 @@ impl MixerOutput {
             }
             _ => (),
         }
-        let response_timeout =
-            timeout.saturating_sub(Instant::now().duration_since(request_instant));
-        match frame_rx.recv_timeout(response_timeout) {
+        let recv_at = Instant::now();
+        time_left = time_left.saturating_sub(recv_at.saturating_duration_since(trig_at));
+        match frame_rx.recv_timeout(time_left) {
             Ok(x) => {
                 let n = x.len().min(data.len());
                 data[..n].copy_from_slice(&x[..n]);
