@@ -197,10 +197,21 @@ where
     }
 }
 
+type HandleMap = Arc<
+    DashMap<
+        TaskId,
+        (
+            JoinHandle<()>,
+            CancellationToken,
+            crossfire::MAsyncRx<crossfire::mpmc::Null>,
+        ),
+    >,
+>;
+
 struct TaskGuard {
     task_id: TaskId,
     tasks: Arc<DashMap<TaskId, TaskState>>,
-    handles: Arc<DashMap<TaskId, (JoinHandle<()>, CancellationToken)>>,
+    handles: HandleMap,
     progress_handle: Option<JoinHandle<()>>,
     ttl: Duration,
 }
@@ -211,29 +222,25 @@ impl Drop for TaskGuard {
             ph.abort();
         }
         self.handles.remove(&self.task_id);
-        let current_state = self.tasks.get(&self.task_id).map(|s| s.clone());
-        let is_handled = current_state
-            .as_ref()
-            .map(|s| s.is_terminal() || s.is_cancelling())
-            .unwrap_or(false);
-        if !is_handled {
-            self.tasks.insert(
-                self.task_id,
-                TaskState::Failed(Arc::new("Task executed with panic or aborted".to_string())),
-            );
-        }
-        let is_cancelling = current_state
-            .as_ref()
-            .map(|s| s.is_cancelling())
-            .unwrap_or(false);
-        if !is_cancelling {
-            let tasks = Arc::clone(&self.tasks);
-            let task_id = self.task_id;
-            let ttl = self.ttl;
-            tokio::spawn(async move {
-                tokio::time::sleep(ttl).await;
-                tasks.remove(&task_id);
-            });
+        if let Some(current_state) = self.tasks.get(&self.task_id) {
+            let is_handled = current_state.is_terminal() || current_state.is_cancelling();
+            let is_cancelling = current_state.is_cancelling();
+            drop(current_state);
+            if !is_handled {
+                self.tasks.insert(
+                    self.task_id,
+                    TaskState::Failed(Arc::new("Task executed with panic or aborted".to_string())),
+                );
+            }
+            if !is_cancelling {
+                let tasks = Arc::clone(&self.tasks);
+                let task_id = self.task_id;
+                let ttl = self.ttl;
+                tokio::spawn(async move {
+                    tokio::time::sleep(ttl).await;
+                    tasks.remove(&task_id);
+                });
+            }
         }
     }
 }
@@ -243,7 +250,7 @@ pub struct TaskManager {
     next_id: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     tasks: Arc<DashMap<TaskId, TaskState>>,
-    handles: Arc<DashMap<TaskId, (JoinHandle<()>, CancellationToken)>>,
+    handles: HandleMap,
 }
 
 impl TaskManager {
@@ -300,6 +307,7 @@ impl TaskManager {
         let token = CancellationToken::new();
         let task_token = token.clone();
         let (status_tx, status_rx) = ProgressChannel::new();
+        let (death_tx, death_rx) = crossfire::mpmc::Null::new().new_async();
         self.tasks.insert(task_id, TaskState::Pending);
         let tasks_for_progress = Arc::clone(&self.tasks);
         let tasks_for_result = Arc::clone(&self.tasks);
@@ -317,26 +325,38 @@ impl TaskManager {
                 progress_handle: Some(progress_handle),
                 ttl: Duration::from_secs(60),
             };
-            let result = FutureExt::catch_unwind(AssertUnwindSafe(f(status_tx, task_token))).await;
-            match result {
-                Ok(Ok(val)) => {
-                    tasks_for_result.insert(task_id, TaskState::Completed(Arc::new(val)));
-                }
-                Ok(Err(err)) => {
-                    tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
-                }
-                Err(_panic) => {
-                    tasks_for_result.insert(
-                        task_id,
-                        TaskState::Failed(Arc::new("Task panicked during execution".to_string())),
-                    );
+            let _death_tx = death_tx;
+            let res =
+                FutureExt::catch_unwind(AssertUnwindSafe(async { f(status_tx, task_token).await }))
+                    .await;
+            let is_cancelling = tasks_for_result
+                .get(&task_id)
+                .map(|s| s.is_cancelling() || s.is_cancelled())
+                .unwrap_or(false);
+            if !is_cancelling {
+                match res {
+                    Ok(Ok(val)) => {
+                        tasks_for_result.insert(task_id, TaskState::Completed(Arc::new(val)));
+                    }
+                    Ok(Err(err)) => {
+                        tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
+                    }
+                    Err(_panic) => {
+                        tasks_for_result.insert(
+                            task_id,
+                            TaskState::Failed(Arc::new(
+                                "Task panicked during execution".to_string(),
+                            )),
+                        );
+                    }
                 }
             }
             if let Some(ph) = guard.progress_handle.take() {
                 ph.abort();
             }
         });
-        self.handles.insert(task_id, (worker_handle, token));
+        self.handles
+            .insert(task_id, (worker_handle, token, death_rx));
         if self.closed.load(Ordering::SeqCst) {
             self.cancel_task(task_id);
         } else if let Some(state) = self.tasks.get(&task_id) {
@@ -367,6 +387,7 @@ impl TaskManager {
         let token = CancellationToken::new();
         let task_token = token.clone();
         let (status_tx, status_rx) = ProgressChannel::new();
+        let (death_tx, death_rx) = crossfire::mpmc::Null::new().new_async();
         self.tasks.insert(task_id, TaskState::Pending);
         let tasks_for_progress = Arc::clone(&self.tasks);
         let tasks_for_result = Arc::clone(&self.tasks);
@@ -384,28 +405,39 @@ impl TaskManager {
                 progress_handle: Some(progress_handle),
                 ttl: Duration::from_secs(60),
             };
-            let blocking_res = tokio::task::spawn_blocking(move || f(status_tx, task_token)).await;
-            match blocking_res {
-                Ok(Ok(val)) => {
-                    tasks_for_result.insert(task_id, TaskState::Completed(Arc::new(val)));
-                }
-                Ok(Err(err)) => {
-                    tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
-                }
-                Err(_join_err) => {
-                    tasks_for_result.insert(
-                        task_id,
-                        TaskState::Failed(Arc::new(
-                            "Blocking task panicked or cancelled".to_string(),
-                        )),
-                    );
+            let blocking_res = tokio::task::spawn_blocking(move || {
+                let _death_tx = death_tx;
+                f(status_tx, task_token)
+            })
+            .await;
+            let is_cancelling = tasks_for_result
+                .get(&task_id)
+                .map(|s| s.is_cancelling() || s.is_cancelled())
+                .unwrap_or(false);
+            if !is_cancelling {
+                match blocking_res {
+                    Ok(Ok(val)) => {
+                        tasks_for_result.insert(task_id, TaskState::Completed(Arc::new(val)));
+                    }
+                    Ok(Err(err)) => {
+                        tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
+                    }
+                    Err(_panic) => {
+                        tasks_for_result.insert(
+                            task_id,
+                            TaskState::Failed(Arc::new(
+                                "Task panicked during execution".to_string(),
+                            )),
+                        );
+                    }
                 }
             }
             if let Some(ph) = guard.progress_handle.take() {
                 ph.abort();
             }
         });
-        self.handles.insert(task_id, (worker_handle, token));
+        self.handles
+            .insert(task_id, (worker_handle, token, death_rx));
         if self.closed.load(Ordering::SeqCst) {
             self.cancel_task(task_id);
         } else if let Some(state) = self.tasks.get(&task_id) {
@@ -433,14 +465,17 @@ impl TaskManager {
         } else {
             return;
         }
-        if let Some((_, (mut handle, token))) = self.handles.remove(&task_id) {
+        if let Some((_, (handle, token, death_rx))) = self.handles.remove(&task_id) {
             token.cancel();
             let tasks = Arc::clone(&self.tasks);
             tokio::spawn(async move {
-                let graceful_exit = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+                let graceful_exit =
+                    tokio::time::timeout(Duration::from_secs(5), &mut death_rx.recv()).await;
                 if graceful_exit.is_err() {
                     handle.abort();
-                    let _ = handle.await; // 如果task还没死就一直等着
+                    // 如果task还没死就一直等着
+                    let _ = death_rx.recv().await;
+                    let _ = handle.await;
                 }
                 if let Some(mut state) = tasks.get_mut(&task_id) {
                     *state = TaskState::Cancelled;
@@ -451,17 +486,11 @@ impl TaskManager {
         }
     }
 
-    pub fn remove_task(&self, task_id: TaskId) {
-        self.cancel_task(task_id);
-        self.tasks.remove(&task_id);
-    }
-
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let task_ids: Vec<TaskId> = self.handles.iter().map(|entry| *entry.key()).collect();
         for id in task_ids {
             self.cancel_task(id);
-            self.tasks.remove(&id);
         }
     }
 
@@ -499,9 +528,5 @@ where
 
     pub fn cancel(&self) {
         self.manager.cancel_task(self.id);
-    }
-
-    pub fn remove(&self) {
-        self.manager.remove_task(self.id);
     }
 }
