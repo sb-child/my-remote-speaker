@@ -74,7 +74,8 @@ impl MixerOutput {
             }
             _ => (),
         }
-        let response_timeout = timeout - (Instant::now() - request_instant);
+        let response_timeout =
+            timeout.saturating_sub(Instant::now().duration_since(request_instant));
         match frame_rx.recv_timeout(response_timeout) {
             Ok(x) => {
                 let n = x.len().min(data.len());

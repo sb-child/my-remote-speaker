@@ -426,7 +426,7 @@ fn stream_callback_handler(
 ) {
     // read frames from mixer
     let t = cbi.timestamp();
-    let read_timeout = t.playback - t.callback;
+    let read_timeout = t.playback.duration_since(t.callback);
     mixer_out.read_frames(data, read_timeout);
     // last, pass the dc blocker
     dc_blocker.process_interleaved(data);
