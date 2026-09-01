@@ -133,9 +133,10 @@ impl MixerOutput {
             // 断开的时间
             let skip_at = Instant::now();
             let dur = skip_at.duration_since(self.disconnect_at.load(Ordering::Acquire));
-            let skip_samples = (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
+            // 2 channel * 48000 Hz * seconds
+            let skip_items = 2 * (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
             // 快进 buffer
-            match self.trig_tx.send_timeout((skip_samples, None), time_left) {
+            match self.trig_tx.send_timeout((skip_items, None), time_left) {
                 Err(SendTimeoutError::Timeout(_v)) => {
                     return 0;
                 }
@@ -205,6 +206,11 @@ impl Track {
             },
             TrackHandle { clip_queue_tx },
         )
+    }
+
+    pub fn skip_frames(&mut self, items: usize) -> usize {
+        // todo
+        0
     }
 
     /// 读取音频轨道，填充 data。返回成功填充的元素数。
@@ -294,6 +300,13 @@ impl Clip {
         let count = available.len().min(data.len());
         data[..count].copy_from_slice(&available[..count]);
         count
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        if self.skip.load(Ordering::Relaxed) {
+            return 0;
+        }
+        self.sample.len()
     }
 
     pub(crate) fn is_timeout(&self) -> bool {
