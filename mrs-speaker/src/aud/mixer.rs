@@ -11,7 +11,7 @@ pub struct Mixers {}
 pub enum MixerCmd {
     AddTrack((Track, crossfire::Rx<crossfire::spsc::Array<u64>>)),
     RemoveTrack((u64, crossfire::Rx<crossfire::spsc::Array<bool>>)),
-    InsertClip((u64, Clip, crossfire::Rx<crossfire::spsc::Array<bool>>)),
+    InsertClip((u64, ClipGroup, crossfire::Rx<crossfire::spsc::Array<bool>>)),
 }
 
 /// 混音器
@@ -65,8 +65,8 @@ impl MixerOutput {
 ///
 /// 可以放置多个不重叠的片段。
 pub struct Track {
-    current_clip: Option<(Clip, usize)>,
-    clip_queue_rx: crossfire::Rx<crossfire::mpsc::Array<Clip>>,
+    current_clip: Option<(ClipGroup, usize)>,
+    clip_queue_rx: crossfire::Rx<crossfire::mpsc::Array<ClipGroup>>,
 }
 
 impl Track {
@@ -116,7 +116,7 @@ impl Track {
 }
 
 pub struct TrackHandle {
-    clip_queue_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<Clip>>,
+    clip_queue_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<ClipGroup>>,
 }
 
 impl TrackHandle {}
@@ -171,6 +171,85 @@ impl Clip {
         count
     }
 
+    pub(crate) fn is_timeout(&self) -> bool {
+        self.timeout.load(Ordering::Relaxed)
+    }
+}
+
+pub struct ClipHandle {
+    skip: Arc<AtomicBool>,
+    timeout: Arc<AtomicBool>,
+    done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
+}
+
+use std::collections::VecDeque;
+
+pub struct ClipGroup {
+    /// Clip 队列，第一个是正在播放的
+    clips: VecDeque<Clip>,
+    /// 正在播放的 Clip 进度
+    clip_pos: usize,
+    /// ClipGroup 进度
+    pos: usize,
+    skip: Arc<AtomicBool>,
+    timeout: Arc<AtomicBool>,
+    _done_tx: crossfire::null::CloseHandle<crossfire::mpsc::Null>,
+}
+
+impl ClipGroup {
+    pub fn new(clips: Vec<Clip>) -> (Self, ClipGroupHandle) {
+        debug_assert!(!clips.is_empty(), "ClipGroup can't be empty");
+        let skip: Arc<AtomicBool> = Default::default();
+        let timeout: Arc<AtomicBool> = Default::default();
+        let (done_tx, done_rx): (
+            crossfire::null::CloseHandle<crossfire::mpsc::Null>,
+            crossfire::AsyncRx<crossfire::mpsc::Null>,
+        ) = crossfire::mpsc::Null::new().new_async();
+        (
+            Self {
+                clips: clips.into(),
+                clip_pos: 0,
+                pos: 0,
+                skip: skip.clone(),
+                timeout: timeout.clone(),
+                _done_tx: done_tx,
+            },
+            ClipGroupHandle {
+                done_rx,
+                skip,
+                timeout,
+            },
+        )
+    }
+
+    pub fn read_frames(&mut self, start_idx: usize, data: &mut [f32]) -> usize {
+        if self.skip.load(Ordering::Relaxed) {
+            return 0;
+        }
+        debug_assert_eq!(start_idx, self.pos, "read backward is unsupported");
+        let mut written = 0; // 本次读出的数据量
+        while written < data.len() {
+            while self.clips.front().map_or(false, |c| c.is_timeout()) {
+                self.clips.pop_front(); // 跳过已超时的 Clip
+                self.clip_pos = 0;
+            }
+            let Some(clip) = self.clips.front_mut() else {
+                break; // 队列里没有 Clip 了
+            };
+            // 读取找到的 Clip
+            let n = clip.read_frames(self.clip_pos, &mut data[written..]);
+            if n == 0 {
+                self.clips.pop_front(); // Clip 读不出东西
+                self.clip_pos = 0;
+            } else {
+                self.clip_pos += n; // 更新进度
+                written += n;
+            }
+        }
+        self.pos += written; // 更新进度
+        written
+    }
+
     pub fn into_current_clip(self) -> Option<(Self, usize)> {
         if self.timeout.load(Ordering::Relaxed) {
             None
@@ -180,7 +259,7 @@ impl Clip {
     }
 }
 
-pub struct ClipHandle {
+pub struct ClipGroupHandle {
     skip: Arc<AtomicBool>,
     timeout: Arc<AtomicBool>,
     done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
