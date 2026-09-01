@@ -52,6 +52,8 @@ impl Mixer {
                     if ts.is_terminal() {
                         break;
                     }
+                } else {
+                    break;
                 }
             }
         }
