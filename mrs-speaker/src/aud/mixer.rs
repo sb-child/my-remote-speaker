@@ -3,6 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -21,26 +22,57 @@ pub enum MixerCmd {
 ///
 /// 可以挂载多个轨道，合并为一个输出。
 pub struct Mixer {
-    worker_handle: TaskHandle<(), (), ()>,
+    trig_rx:
+        crossfire::MRx<crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>>,
+    worker: Option<TaskHandle<(), (), ()>>,
 }
 
 impl Mixer {
     pub fn new(tm: &TaskManager) -> (Self, MixerOutput) {
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
-        let worker_handle: TaskHandle<(), (), ()> = tm.spawn_blocking_typed(|pc, ct| {
-            pc.update(()).ok();
-            mixer_worker(trig_rx, ct);
-            Ok(())
-        });
-        let out_errored = Default::default();
+        let worker = spawn_mixer_worker(tm, trig_rx.clone());
         (
-            Self { worker_handle },
+            Self {
+                trig_rx,
+                worker: Some(worker),
+            },
             MixerOutput {
                 trig_tx,
-                errored: out_errored,
+                errored: Default::default(),
             },
         )
     }
+
+    pub fn restart(&mut self, tm: &TaskManager) {
+        if let Some(w) = self.worker.take() {
+            w.cancel(); // worker 不会立刻关闭
+            loop {
+                thread::sleep(Duration::from_millis(100));
+                if let Some(
+                    TypedTaskState::Cancelled
+                    | TypedTaskState::Completed(_)
+                    | TypedTaskState::Failed(_),
+                ) = w.status()
+                {
+                    break;
+                }
+            }
+        }
+        self.worker = Some(spawn_mixer_worker(tm, self.trig_rx.clone()));
+    }
+}
+
+fn spawn_mixer_worker(
+    tm: &TaskManager,
+    trig_rx: crossfire::MRx<
+        crossfire::mpmc::Array<(usize, crossfire::oneshot::TxOneshot<Vec<f32>>)>,
+    >,
+) -> TaskHandle<(), (), ()> {
+    tm.spawn_blocking_typed(move |pc, ct| {
+        pc.update(()).ok();
+        mixer_worker(trig_rx, ct);
+        Ok(())
+    })
 }
 
 fn mixer_worker(
@@ -49,6 +81,21 @@ fn mixer_worker(
     >,
     ct: CancellationToken,
 ) {
+    loop {
+        let (size, frame_tx) = match trig_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(x) => x,
+            Err(RecvTimeoutError::Timeout) => {
+                if ct.is_cancelled() {
+                    return;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return;
+            }
+        };
+        // todo
+    }
 }
 
 pub struct MixerHandle {}
@@ -68,20 +115,19 @@ impl MixerOutput {
 
     pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
         if self.errored.load(Ordering::Relaxed) {
-            return 0; // 如果出现错误说明要么 mixer_worker 死了，要么并发读。
+            return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
         }
         // 开销是一次box堆分配
         let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
         let request_instant = Instant::now();
         match self.trig_tx.send_timeout((data.len(), frame_tx), timeout) {
             Err(SendTimeoutError::Timeout(_v)) => {
-                // 因为 mixer_worker 超时，trig_tx 积攒了一个 message。
-                // mixer_worker 最终会发现 frame_rx 已被 drop 所以没问题。
+                // trig_tx 积攒了一个 message。mixer_worker 最终会发现 frame_rx 已被 drop 所以没问题。
                 return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
                 self.errored.store(true, Ordering::Relaxed);
-                return 0; // mixer_worker 死了
+                return 0; // mixer 死了
             }
             _ => (),
         }
@@ -94,11 +140,11 @@ impl MixerOutput {
                 n
             }
             Err(RecvTimeoutError::Timeout) => {
-                0 // mixer_thread 响应超时
+                0 // mixer_worker 响应超时
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.errored.store(true, Ordering::Relaxed);
-                0 // mixer_thread 死了
+                0 // mixer 死了
             }
         }
     }
@@ -228,7 +274,7 @@ pub struct ClipHandle {
 use std::collections::VecDeque;
 
 use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
-use my_remote_speaker::task::{TaskHandle, TaskManager};
+use my_remote_speaker::task::{TaskHandle, TaskManager, TypedTaskState};
 use tokio_util::sync::CancellationToken;
 
 pub struct ClipGroup {

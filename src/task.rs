@@ -20,6 +20,7 @@ pub type TaskId = u64;
 pub enum TaskState {
     Pending,
     Running(Arc<dyn Any + Send + Sync>),
+    Cancelling,
     Completed(Arc<dyn Any + Send + Sync>),
     Failed(Arc<dyn Any + Send + Sync>),
     Cancelled,
@@ -31,6 +32,9 @@ impl TaskState {
     }
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running(_))
+    }
+    pub fn is_cancelling(&self) -> bool {
+        matches!(self, Self::Cancelling)
     }
     pub fn is_completed(&self) -> bool {
         matches!(self, Self::Completed(_))
@@ -95,6 +99,7 @@ impl TaskState {
     {
         Some(match self {
             TaskState::Pending => TypedTaskState::Pending,
+            TaskState::Cancelling => TypedTaskState::Cancelling,
             TaskState::Cancelled => TypedTaskState::Cancelled,
             TaskState::Running(v) => v
                 .clone()
@@ -122,6 +127,7 @@ impl fmt::Debug for TaskState {
         match self {
             TaskState::Pending => write!(f, "TaskState::Pending"),
             TaskState::Running(_) => write!(f, "TaskState::Running"),
+            TaskState::Cancelling => write!(f, "TaskState::Cancelling"),
             TaskState::Completed(_) => write!(f, "TaskState::Completed"),
             TaskState::Failed(_) => write!(f, "TaskState::Failed"),
             TaskState::Cancelled => write!(f, "TaskState::Cancelled"),
@@ -133,9 +139,35 @@ impl fmt::Debug for TaskState {
 pub enum TypedTaskState<P, T, E> {
     Pending,
     Running(Arc<P>),
+    Cancelling,
     Completed(Arc<T>),
     Failed(Arc<E>),
     Cancelled,
+}
+
+impl<P, T, E> TypedTaskState<P, T, E> {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+    pub fn is_cancelling(&self) -> bool {
+        matches!(self, Self::Cancelling)
+    }
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed(_))
+    }
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed(_) | Self::Failed(_) | Self::Cancelled)
+    }
 }
 
 pub struct ProgressChannel<P>
@@ -179,24 +211,30 @@ impl Drop for TaskGuard {
             ph.abort();
         }
         self.handles.remove(&self.task_id);
-        let is_terminal = self
-            .tasks
-            .get(&self.task_id)
-            .map(|s| s.is_terminal())
+        let current_state = self.tasks.get(&self.task_id).map(|s| s.clone());
+        let is_handled = current_state
+            .as_ref()
+            .map(|s| s.is_terminal() || s.is_cancelling())
             .unwrap_or(false);
-        if !is_terminal {
+        if !is_handled {
             self.tasks.insert(
                 self.task_id,
                 TaskState::Failed(Arc::new("Task executed with panic or aborted".to_string())),
             );
         }
-        let tasks = Arc::clone(&self.tasks);
-        let task_id = self.task_id;
-        let ttl = self.ttl;
-        tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
-            tasks.remove(&task_id);
-        });
+        let is_cancelling = current_state
+            .as_ref()
+            .map(|s| s.is_cancelling())
+            .unwrap_or(false);
+        if !is_cancelling {
+            let tasks = Arc::clone(&self.tasks);
+            let task_id = self.task_id;
+            let ttl = self.ttl;
+            tokio::spawn(async move {
+                tokio::time::sleep(ttl).await;
+                tasks.remove(&task_id);
+            });
+        }
     }
 }
 
@@ -387,12 +425,28 @@ impl TaskManager {
     }
 
     pub fn cancel_task(&self, task_id: TaskId) {
+        if let Some(mut state) = self.tasks.get_mut(&task_id) {
+            if state.is_terminal() || matches!(*state, TaskState::Cancelling) {
+                return;
+            }
+            *state = TaskState::Cancelling;
+        } else {
+            return;
+        }
         if let Some((_, (handle, token))) = self.handles.remove(&task_id) {
             token.cancel();
-            handle.abort();
-            self.tasks.insert(task_id, TaskState::Cancelled);
             let tasks = Arc::clone(&self.tasks);
             tokio::spawn(async move {
+                let mut handle = handle;
+                tokio::select! {
+                    _ = &mut handle => {}
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        handle.abort();
+                    }
+                }
+                if let Some(mut state) = tasks.get_mut(&task_id) {
+                    *state = TaskState::Cancelled;
+                }
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 tasks.remove(&task_id);
             });

@@ -136,7 +136,7 @@ fn get_device_status(
                     }
                 },
             },
-            TypedTaskState::Cancelled => {
+            TypedTaskState::Cancelling | TypedTaskState::Cancelled => {
                 warn!("Cancelled by TaskManager. Will not restart.");
                 None
             }
