@@ -23,7 +23,7 @@ use std::ffi::c_void;
 use std::time::Duration;
 use std::{fs, path::PathBuf};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[cfg(feature = "android")]
 pub fn entrypoint(
@@ -143,8 +143,6 @@ fn run_magisk_daemon(
     let kps = rmt::keypair::KeypairService::new(&conf_path)?;
     let smps = SampleStoreService::new(&conf_path)?;
     let smcs = SampleCacheService::new(&temp_path)?;
-    // let audio_host = cpal::default_host();
-    test_audio();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -173,8 +171,6 @@ fn run_normal_daemon(
     info!("Public key: [{}]", key_encode(&pubkey_bytes));
     let smps = SampleStoreService::new(&conf_path)?;
     let smcs = SampleCacheService::new(&temp_path)?;
-    // let audio_host = cpal::default_host();
-    test_audio();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -200,10 +196,21 @@ async fn daemon_app(
         tokio::spawn(stop_file_handler(sf, ct.clone()));
     }
     let clock = AccurateClock::new();
-    clock.wait_for_sync().await;
-    let now_ntp = clock.now().await;
-    let now_local = chrono::Utc::now();
-    info!("now_ntp = {}, now_local = {}", now_ntp, now_local);
+    let c = clock.clone();
+    let clock_wait_sync_handle = tokio::spawn(async move {
+        c.wait_for_sync().await;
+        let now_ntp = c.now().await;
+        let now_local = chrono::Utc::now();
+        info!("Clock: now_ntp: {}, now_local: {}", now_ntp, now_local);
+    });
+    let ct2 = ct.clone();
+    let c = clock.clone();
+    tokio::spawn(async move {
+        ct2.cancelled().await;
+        clock_wait_sync_handle.abort();
+        clock_wait_sync_handle.await.ok();
+        c.close().await;
+    });
     rmt::bind_endpoint(kps, smps, smcs, ct).await?;
     Ok(())
 }
@@ -225,24 +232,4 @@ async fn stop_file_handler(stop_file: PathBuf, cancel_token: CancellationToken) 
             }
         }
     }
-}
-
-fn test_audio() {
-    // let audio_host = cpal::default_host();
-    // let default_dev = audio_host.default_output_device();
-    // if let Some(dev) = default_dev {
-    //     info!("default_output_device: {:?}", dev);
-    // }
-    // match audio_host.output_devices() {
-    //     Ok(devs) => {
-    //         for d in devs {
-    //             info!("output_device: {:?}", d);
-    //             // let desc = d.description().unwrap();
-    //             // desc.device_type();
-    //         }
-    //     }
-    //     Err(e) => {
-    //         warn!("Failed to get output_devices: {:?}", e);
-    //     }
-    // }
 }

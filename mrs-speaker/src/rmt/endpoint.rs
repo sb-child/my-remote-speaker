@@ -7,7 +7,7 @@ use my_remote_speaker::{
         MrsRpcTrait, QuerySampleError, RemoveSampleError, SampleInfo, StoreSampleError,
         StoreSampleProgress, StoreSampleTaskState, TaskManageError,
     },
-    task::{TaskChannel, TaskId, TaskState, TypedTaskState},
+    task::{TaskChannel, TaskId, TypedTaskState},
 };
 use surrealkv::Tree;
 use tarpc::{

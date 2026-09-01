@@ -1,5 +1,4 @@
 use std::{
-    default::Default,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},

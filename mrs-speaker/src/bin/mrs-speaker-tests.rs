@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use mrs_speaker::aud;
 use my_remote_speaker::task::TaskManager;
 use std::time::Duration;
