@@ -156,6 +156,8 @@ impl MixerOutput {
             // 快进 buffer
             match self.trig_tx.send_timeout((skip_items, None), time_left) {
                 Err(SendTimeoutError::Timeout(_v)) => {
+                    // trig channel 积攒了一个 message，刚发的 message 被退回。
+                    // 只有 read_frames 被并发调用或 mixer_worker 忙时才能触发这里。但此方法不允许并发调用。
                     return 0;
                 }
                 Err(SendTimeoutError::Disconnected(_v)) => {
@@ -178,7 +180,8 @@ impl MixerOutput {
         {
             Err(SendTimeoutError::Timeout(_v)) => {
                 // trig channel 积攒了一个 message，刚发的 message 被退回。
-                // 上一个 message 的 frame_rx 已被 drop，让 worker 对它发送的内容被自动 drop 所以没问题。
+                // 上一个 `Some(frame_tx)` 的 `frame_rx` 已被 drop，让 worker 对它发送的内容被自动 drop 所以没问题
+                // 只有 read_frames 被并发调用或 mixer_worker 忙时才能触发这里。但此方法不允许并发调用。
                 return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
