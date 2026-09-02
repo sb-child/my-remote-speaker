@@ -27,9 +27,8 @@ pub struct Mixers {}
 use_id!(Track);
 
 pub enum MixerCmd {
-    AddTrack(Track, OneshotTx<TrackId>),
-    RemoveTrack(TrackId, OneshotTx<bool>),
-    InsertClip(TrackId, ClipGroup, OneshotTx<bool>),
+    AddTracks(Vec<Track>, OneshotTx<Vec<TrackId>>),
+    RemoveTrack(Vec<TrackId>, OneshotTx<Vec<bool>>),
 }
 
 type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
