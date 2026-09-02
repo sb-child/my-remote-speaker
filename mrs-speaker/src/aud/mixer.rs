@@ -16,8 +16,8 @@ use std::{
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-type OneshotResp<T> = crossfire::oneshot::RxOneshot<T>;
-type OneshotReq<T> = crossfire::oneshot::TxOneshot<T>;
+type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
+type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 
 /// 混音器管理器
 ///
@@ -27,15 +27,15 @@ pub struct Mixers {}
 use_id!(Track);
 
 pub enum MixerCmd {
-    AddTrack(Track, OneshotResp<TrackId>),
-    RemoveTrack(TrackId, OneshotResp<bool>),
-    InsertClip(TrackId, ClipGroup, OneshotResp<bool>),
+    AddTrack(Track, OneshotTx<TrackId>),
+    RemoveTrack(TrackId, OneshotTx<bool>),
+    InsertClip(TrackId, ClipGroup, OneshotTx<bool>),
 }
 
 type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
 type MixerCmdRx = crossfire::MRx<crossfire::mpmc::Array<MixerCmd>>;
 
-type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<(usize, Option<OneshotReq<Vec<f32>>>)>>;
+type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>;
 
 /// 混音器
 ///
@@ -106,13 +106,16 @@ fn spawn_mixer_worker(
 }
 
 fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken) {
-    let mut sel = Select::new_bias();
-    sel.add(&trig_rx); // 优先级最高
+    let mut sel = Select::new();
+    sel.add(&trig_rx);
     sel.add(&cmd_rx);
     loop {
         match sel.select_timeout(Duration::from_millis(50)) {
             Ok(res) => {
                 select_mixer_channel(&trig_rx, &cmd_rx, &mut sel, res);
+                if ct.is_cancelled() {
+                    return;
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
                 if ct.is_cancelled() {
@@ -172,7 +175,7 @@ pub struct MixerHandle {
 /// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
 pub struct MixerOutput {
-    trig_tx: crossfire::MTx<crossfire::mpmc::Array<(usize, Option<OneshotReq<Vec<f32>>>)>>,
+    trig_tx: crossfire::MTx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>,
     read_frames_errored: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
     disconnect_at: Arc<AtomicInstant>,

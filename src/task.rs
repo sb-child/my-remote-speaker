@@ -1,7 +1,6 @@
 use crate::use_id;
 use dashmap::DashMap;
 use futures_util::FutureExt;
-use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     fmt,
@@ -9,7 +8,7 @@ use std::{
     panic::AssertUnwindSafe,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
