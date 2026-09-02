@@ -230,7 +230,7 @@ where
 {
     pub fn update(&self, state: P) {
         self.tasks.alter(&self.task_id, |_k, v| {
-            if v.is_running() {
+            if v.is_running() || v.is_pending() {
                 return TaskState::Running(Arc::new(state));
             }
             v
@@ -365,26 +365,21 @@ impl TaskManager {
             let res =
                 FutureExt::catch_unwind(AssertUnwindSafe(async { f(progress, task_token).await }))
                     .await;
-            // todo: rewrite to
-            // tasks_for_result.alter(&task_id, |k, v| { ... });
-            let is_cancelling = tasks_for_result
-                .get(&task_id)
-                .map(|s| s.is_cancelling() || s.is_cancelled())
-                .unwrap_or(false);
-            if !is_cancelling {
-                match res {
-                    Ok(Ok(val)) => {
-                        tasks_for_result.insert(task_id, TaskState::Completed(Arc::new(val)));
-                    }
-                    Ok(Err(err)) => {
-                        tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
-                    }
-                    Err(panic) => {
-                        let msg = panic_payload_to_string(panic.as_ref());
-                        tasks_for_result.insert(task_id, TaskState::Panicked(Arc::new(msg)));
-                    }
+
+            let terminal_state = match res {
+                Ok(Ok(val)) => TaskState::Completed(Arc::new(val)),
+                Ok(Err(err)) => TaskState::Failed(Arc::new(err)),
+                Err(panic) => {
+                    let msg = panic_payload_to_string(panic.as_ref());
+                    TaskState::Panicked(Arc::new(msg))
                 }
-            }
+            };
+            tasks_for_result.alter(&task_id, |_k, v| {
+                match v.is_cancelling() | v.is_cancelled() {
+                    true => v,
+                    false => terminal_state,
+                }
+            });
         });
         self.handles
             .insert(task_id, (worker_handle, token, death_rx));
@@ -438,29 +433,23 @@ impl TaskManager {
                 f(progress, task_token)
             })
             .await;
-            // todo: rewrite to
-            // tasks_for_result.alter(&task_id, |k, v| { ... });
-            let is_cancelling = tasks_for_result
-                .get(&task_id)
-                .map(|s| s.is_cancelling() || s.is_cancelled())
-                .unwrap_or(false);
-            if !is_cancelling {
-                match blocking_res {
-                    Ok(Ok(val)) => {
-                        tasks_for_result.insert(task_id, TaskState::Completed(Arc::new(val)));
-                    }
-                    Ok(Err(err)) => {
-                        tasks_for_result.insert(task_id, TaskState::Failed(Arc::new(err)));
-                    }
-                    Err(join_err) => {
-                        let msg = match join_err.try_into_panic() {
-                            Ok(panic_err) => panic_payload_to_string(panic_err.as_ref()),
-                            Err(_join_err) => "Task was cancelled or aborted".to_string(),
-                        };
-                        tasks_for_result.insert(task_id, TaskState::Panicked(Arc::new(msg)));
-                    }
+            let terminal_state = match blocking_res {
+                Ok(Ok(val)) => TaskState::Completed(Arc::new(val)),
+                Ok(Err(err)) => TaskState::Failed(Arc::new(err)),
+                Err(join_err) => {
+                    let msg = match join_err.try_into_panic() {
+                        Ok(panic_err) => panic_payload_to_string(panic_err.as_ref()),
+                        Err(_join_err) => "Task was cancelled or aborted".to_string(),
+                    };
+                    TaskState::Panicked(Arc::new(msg))
                 }
-            }
+            };
+            tasks_for_result.alter(&task_id, |_k, v| {
+                match v.is_cancelling() | v.is_cancelled() {
+                    true => v,
+                    false => terminal_state,
+                }
+            });
         });
         self.handles
             .insert(task_id, (worker_handle, token, death_rx));
