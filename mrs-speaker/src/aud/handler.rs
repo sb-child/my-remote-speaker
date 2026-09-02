@@ -276,7 +276,7 @@ fn device_handler(
         buffer_size: BufferSize::Fixed(256),
     };
     let device_wait_timeout = Duration::from_secs(1);
-    let (mixer, mixer_out) = Mixer::new(tm, ct.clone()); // todo，之后会移走
+    let (mixer, mixer_handle, mixer_out) = Mixer::new(tm, ct.clone()); // todo，之后会移走
     stream_handler(
         &dev_id.to_string(),
         device,

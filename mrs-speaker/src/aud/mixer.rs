@@ -1,7 +1,8 @@
 use crate::aud::SAMPLE_RATE;
-use crossfire::{BlockingTxTrait, RecvTimeoutError, SendTimeoutError};
+use crossfire::{BlockingTxTrait, RecvError, RecvTimeoutError, SendTimeoutError, select::Select};
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager},
+    use_id,
     util::AtomicInstant,
 };
 use std::{
@@ -15,22 +16,26 @@ use std::{
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+type OneshotResp<T> = crossfire::oneshot::RxOneshot<T>;
+type OneshotReq<T> = crossfire::oneshot::TxOneshot<T>;
+
 /// 混音器管理器
 ///
 /// 可以动态创建和删除混音器。
 pub struct Mixers {}
 
+use_id!(Track);
+
 pub enum MixerCmd {
-    AddTrack((Track, crossfire::Rx<crossfire::spsc::Array<u64>>)),
-    RemoveTrack((u64, crossfire::Rx<crossfire::spsc::Array<bool>>)),
-    InsertClip((u64, ClipGroup, crossfire::Rx<crossfire::spsc::Array<bool>>)),
+    AddTrack(Track, OneshotResp<TrackId>),
+    RemoveTrack(TrackId, OneshotResp<bool>),
+    InsertClip(TrackId, ClipGroup, OneshotResp<bool>),
 }
 
+type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
 type MixerCmdRx = crossfire::MRx<crossfire::mpmc::Array<MixerCmd>>;
 
-type MixerTrigRx = crossfire::MRx<
-    crossfire::mpmc::Array<(usize, Option<crossfire::oneshot::TxOneshot<Vec<f32>>>)>,
->;
+type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<(usize, Option<OneshotReq<Vec<f32>>>)>>;
 
 /// 混音器
 ///
@@ -43,11 +48,11 @@ pub struct Mixer {
 }
 
 impl Mixer {
-    pub fn new(tm: &TaskManager, ct: CancellationToken) -> (Self, MixerOutput) {
+    pub fn new(tm: &TaskManager, ct: CancellationToken) -> (Self, MixerHandle, MixerOutput) {
         let mixer_ct = ct.child_token();
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
         let (cmd_tx, cmd_rx) = crossfire::mpmc::bounded_blocking(16);
-        let worker = spawn_mixer_worker(tm, trig_rx.clone(), &mixer_ct);
+        let worker = spawn_mixer_worker(tm, trig_rx.clone(), cmd_rx.clone(), &mixer_ct);
         let ct_guard = mixer_ct.drop_guard();
         (
             Self {
@@ -56,6 +61,7 @@ impl Mixer {
                 worker: Some(worker),
                 ct_guard,
             },
+            MixerHandle { cmd_tx },
             MixerOutput {
                 trig_tx,
                 read_frames_errored: Default::default(),
@@ -78,6 +84,7 @@ impl Mixer {
         self.worker = Some(spawn_mixer_worker(
             tm,
             self.trig_rx.clone(),
+            self.cmd_rx.clone(),
             self.ct_guard.token(),
         ));
     }
@@ -86,36 +93,60 @@ impl Mixer {
 fn spawn_mixer_worker(
     tm: &TaskManager,
     trig_rx: MixerTrigRx,
+    cmd_rx: MixerCmdRx,
     ct: &CancellationToken,
 ) -> TaskHandle<(), (), ()> {
     let h = tm.spawn_blocking_typed(move |pc, ct| {
         pc.update(()).ok();
-        mixer_worker(trig_rx, ct);
+        mixer_worker(trig_rx, cmd_rx, ct);
         Ok(())
     });
     h.cancel_at(ct);
     h
 }
 
-fn mixer_worker(trig_rx: MixerTrigRx, ct: CancellationToken) {
+fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken) {
+    let mut sel = Select::new_bias();
+    sel.add(&trig_rx); // 优先级最高
+    sel.add(&cmd_rx);
     loop {
-        let (size, r) = match trig_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(x) => x,
+        match sel.select_timeout(Duration::from_millis(50)) {
+            Ok(res) => {
+                select_mixer_channel(&trig_rx, &cmd_rx, &mut sel, res);
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if ct.is_cancelled() {
                     return;
                 }
-                continue;
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                return;
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn select_mixer_channel(
+    trig_rx: &MixerTrigRx,
+    cmd_rx: &MixerCmdRx,
+    sel: &mut crossfire::select::Select<'_>,
+    res: crossfire::select::SelectResult,
+) {
+    if res == *trig_rx {
+        match trig_rx.read_select(res) {
+            Ok((size, r)) => {
+                if let Some(frame_tx) = r {
+                    let buf = mix_tracks(size);
+                    // 如果 frame_rx 被 drop，这里发送的 buf 会自动 drop。
+                    frame_tx.send(buf);
+                } else {
+                    seek_tracks(size);
+                }
             }
-        };
-        if let Some(frame_tx) = r {
-            let buf = mix_tracks(size);
-            frame_tx.send(buf); // 如果 frame_rx 被 drop，这里发送的 buf 会自动 drop。
-        } else {
-            seek_tracks(size);
+            Err(RecvError) => sel.remove(trig_rx),
+        }
+    } else if res == *cmd_rx {
+        match cmd_rx.read_select(res) {
+            Ok(cmd) => handle_mixer_cmd(cmd),
+            Err(RecvError) => sel.remove(cmd_rx),
         }
     }
 }
@@ -130,14 +161,18 @@ fn seek_tracks(items: usize) {
     // todo
 }
 
-pub struct MixerHandle {}
+fn handle_mixer_cmd(cmd: MixerCmd) {
+    // todo
+}
+
+pub struct MixerHandle {
+    cmd_tx: MixerCmdTx,
+}
 
 /// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
 pub struct MixerOutput {
-    trig_tx: crossfire::MTx<
-        crossfire::mpmc::Array<(usize, Option<crossfire::oneshot::TxOneshot<Vec<f32>>>)>,
-    >,
+    trig_tx: crossfire::MTx<crossfire::mpmc::Array<(usize, Option<OneshotReq<Vec<f32>>>)>>,
     read_frames_errored: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
     disconnect_at: Arc<AtomicInstant>,

@@ -1,3 +1,4 @@
+use crate::use_id;
 use dashmap::DashMap;
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -15,22 +16,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskId(u64);
-
-struct AtomicTaskId(AtomicU64);
-
-impl Default for AtomicTaskId {
-    fn default() -> Self {
-        Self(AtomicU64::new(1))
-    }
-}
-
-impl AtomicTaskId {
-    fn next(&self) -> TaskId {
-        TaskId(self.0.fetch_add(1, Ordering::SeqCst))
-    }
-}
+use_id!(Task);
 
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -309,7 +295,7 @@ impl Drop for TaskGuard {
 
 #[derive(Clone, Default)]
 pub struct TaskManager {
-    task_id_counter: Arc<AtomicTaskId>,
+    task_id_counter: Arc<TaskIdCounter>,
     closed: Arc<AtomicBool>,
     tasks: Arc<DashMap<TaskId, TaskState>>,
     handles: HandleMap,
@@ -318,7 +304,7 @@ pub struct TaskManager {
 impl TaskManager {
     pub fn new() -> Self {
         Self {
-            task_id_counter: Arc::new(AtomicTaskId::default()),
+            task_id_counter: Arc::new(TaskIdCounter::default()),
             closed: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(DashMap::new()),
             handles: Arc::new(DashMap::new()),

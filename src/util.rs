@@ -83,3 +83,26 @@ impl AtomicInstant {
         self.anchor + Duration::from_nanos(ns)
     }
 }
+
+pub use pastey::paste;
+
+#[macro_export]
+macro_rules! use_id {
+    ($name:ident) => {
+        $crate::util::paste! {
+            #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+            pub struct [<$name Id>](pub u64);
+            pub struct [<$name IdCounter>](pub std::sync::atomic::AtomicU64);
+            impl Default for [<$name IdCounter>] {
+                fn default() -> Self {
+                    Self(std::sync::atomic::AtomicU64::new(1))
+                }
+            }
+            impl [<$name IdCounter>] {
+                pub fn next(&self) -> [<$name Id>] {
+                    [<$name Id>](self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                }
+            }
+        }
+    };
+}
