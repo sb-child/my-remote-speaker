@@ -26,6 +26,8 @@ pub enum MixerCmd {
     InsertClip((u64, ClipGroup, crossfire::Rx<crossfire::spsc::Array<bool>>)),
 }
 
+type MixerCmdRx = crossfire::MRx<crossfire::mpmc::Array<MixerCmd>>;
+
 type MixerTrigRx = crossfire::MRx<
     crossfire::mpmc::Array<(usize, Option<crossfire::oneshot::TxOneshot<Vec<f32>>>)>,
 >;
@@ -34,6 +36,7 @@ type MixerTrigRx = crossfire::MRx<
 ///
 /// 可以挂载多个轨道，合并为一个输出。
 pub struct Mixer {
+    cmd_rx: MixerCmdRx,
     trig_rx: MixerTrigRx,
     worker: Option<TaskHandle<(), (), ()>>,
     ct_guard: DropGuard,
@@ -43,10 +46,12 @@ impl Mixer {
     pub fn new(tm: &TaskManager, ct: CancellationToken) -> (Self, MixerOutput) {
         let mixer_ct = ct.child_token();
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
+        let (cmd_tx, cmd_rx) = crossfire::mpmc::bounded_blocking(16);
         let worker = spawn_mixer_worker(tm, trig_rx.clone(), &mixer_ct);
         let ct_guard = mixer_ct.drop_guard();
         (
             Self {
+                cmd_rx,
                 trig_rx,
                 worker: Some(worker),
                 ct_guard,
@@ -275,7 +280,6 @@ impl Track {
                 }
             }
         }
-
         total_requested - data.len()
     }
 
