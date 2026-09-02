@@ -189,6 +189,7 @@ pub enum TypedTaskState<P, T, E> {
     Failed(Arc<E>),
     Cancelled,
     Panicked(Arc<String>),
+    Invalid,
 }
 
 impl<P, T, E> TypedTaskState<P, T, E> {
@@ -213,11 +214,18 @@ impl<P, T, E> TypedTaskState<P, T, E> {
     pub fn is_panicked(&self) -> bool {
         matches!(self, Self::Panicked(_))
     }
+    pub fn is_invalid(&self) -> bool {
+        matches!(self, Self::Invalid)
+    }
 
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Completed(_) | Self::Failed(_) | Self::Cancelled | Self::Panicked(_)
+            Self::Completed(_)
+                | Self::Failed(_)
+                | Self::Cancelled
+                | Self::Panicked(_)
+                | Self::Invalid
         )
     }
 }
@@ -497,6 +505,7 @@ impl TaskManager {
         task_id
     }
 
+    /// 获取任务当前状态。
     pub fn get_status(&self, task_id: TaskId) -> Option<TaskState> {
         let state = self.tasks.get(&task_id)?.value().clone();
         if state.is_terminal() {
@@ -505,6 +514,10 @@ impl TaskManager {
         Some(state)
     }
 
+    /// 立刻取消任务。
+    /// - 设置 `state = TaskState::Cancelling` 并触发任务的 `CancellationToken` 然后等待 5 秒。
+    /// - 如果任务仍未关闭则调用 `handle.abort()`。
+    /// - 最后等待任务彻底关闭后设置 `state = TaskState::Cancelled`。
     pub fn cancel_task(&self, task_id: TaskId) {
         if let Some(mut state) = self.tasks.get_mut(&task_id) {
             if state.is_terminal() || matches!(*state, TaskState::Cancelling) {
@@ -535,6 +548,29 @@ impl TaskManager {
         }
     }
 
+    /// 注册触发器，在 ct 触发时取消任务。
+    pub fn cancel_task_at(&self, task_id: TaskId, ct: CancellationToken) {
+        let tm = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let check = tokio::time::timeout(Duration::from_millis(500), ct.cancelled()).await;
+                if let Err(_) = check {
+                    if tm.is_closed() {
+                        break;
+                    } else if tm
+                        .get_status(task_id)
+                        .map(|s| s.is_terminal())
+                        .unwrap_or(true)
+                    {
+                        break;
+                    }
+                } else {
+                    tm.cancel_task(task_id);
+                }
+            }
+        });
+    }
+
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let task_ids: Vec<TaskId> = self.handles.iter().map(|entry| *entry.key()).collect();
@@ -550,7 +586,7 @@ impl TaskManager {
 
 pub struct TaskHandle<P, T, E> {
     pub id: TaskId,
-    manager: TaskManager,
+    tm: TaskManager,
     _phantom: PhantomData<fn() -> (P, T, E)>,
 }
 
@@ -560,22 +596,30 @@ where
     T: 'static + Send + Sync,
     E: 'static + Send + Sync,
 {
-    pub fn new(id: TaskId, manager: TaskManager) -> Self {
+    pub fn new(id: TaskId, tm: TaskManager) -> Self {
         Self {
             id,
-            manager,
+            tm,
             _phantom: PhantomData,
         }
     }
 
-    pub fn status(&self) -> Option<TypedTaskState<P, T, E>> {
-        self.manager
+    /// 获取任务当前状态。
+    pub fn status(&self) -> TypedTaskState<P, T, E> {
+        self.tm
             .get_status(self.id)
             .map(|s| s.to_typed())
             .flatten()
+            .unwrap_or(TypedTaskState::Invalid)
     }
 
+    /// 立刻取消任务。
     pub fn cancel(&self) {
-        self.manager.cancel_task(self.id);
+        self.tm.cancel_task(self.id);
+    }
+
+    /// 注册触发器，在 ct 触发时取消任务。
+    pub fn cancel_at(&self, ct: CancellationToken) {
+        self.tm.cancel_task_at(self.id, ct);
     }
 }

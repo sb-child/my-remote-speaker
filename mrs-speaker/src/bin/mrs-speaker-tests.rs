@@ -40,13 +40,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let args = Cli::parse();
     let task_name = format!("{:?}", args.command);
+    let ct = CancellationToken::new();
     let t = match args.command {
-        Commands::AudioHandler => audio_handler_test(),
+        Commands::AudioHandler => audio_handler_test(ct.child_token()),
     };
     info!("Starting task {}.", task_name);
     let r = rt.block_on(async {
         tokio::select! {
-            r = tokio::signal::ctrl_c() => { r.map_err(|e| Box::new(e).into()) }
+            r = tokio::signal::ctrl_c() => { ct.cancel(); r.map_err(|e| Box::new(e).into()) }
             r = t => { r.map_err(|e| e) }
         }
     });
@@ -62,9 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // -------
 
-async fn audio_handler_test() -> Result<(), Box<dyn std::error::Error>> {
+async fn audio_handler_test(ct: CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
     let tm = TaskManager::new();
-    let ct = CancellationToken::new();
     let tm2 = tm.clone();
     let ct2 = ct.clone();
     let h = tokio::task::spawn_blocking(|| {

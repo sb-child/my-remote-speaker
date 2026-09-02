@@ -36,16 +36,18 @@ type MixerTrigRx = crossfire::MRx<
 pub struct Mixer {
     trig_rx: MixerTrigRx,
     worker: Option<TaskHandle<(), (), ()>>,
+    ct: CancellationToken,
 }
 
 impl Mixer {
-    pub fn new(tm: &TaskManager) -> (Self, MixerOutput) {
+    pub fn new(tm: &TaskManager, ct: CancellationToken) -> (Self, MixerOutput) {
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
-        let worker = spawn_mixer_worker(tm, trig_rx.clone());
+        let worker = spawn_mixer_worker(tm, trig_rx.clone(), ct.clone());
         (
             Self {
                 trig_rx,
                 worker: Some(worker),
+                ct,
             },
             MixerOutput {
                 trig_tx,
@@ -61,25 +63,31 @@ impl Mixer {
             w.cancel(); // worker 不会立刻关闭
             loop {
                 thread::sleep(Duration::from_millis(100));
-                if let Some(ts) = w.status() {
-                    if ts.is_terminal() {
-                        break;
-                    }
-                } else {
+                if w.status().is_terminal() {
                     break;
                 }
             }
         }
-        self.worker = Some(spawn_mixer_worker(tm, self.trig_rx.clone()));
+        self.worker = Some(spawn_mixer_worker(
+            tm,
+            self.trig_rx.clone(),
+            self.ct.clone(),
+        ));
     }
 }
 
-fn spawn_mixer_worker(tm: &TaskManager, trig_rx: MixerTrigRx) -> TaskHandle<(), (), ()> {
-    tm.spawn_blocking_typed(move |pc, ct| {
+fn spawn_mixer_worker(
+    tm: &TaskManager,
+    trig_rx: MixerTrigRx,
+    ct: CancellationToken,
+) -> TaskHandle<(), (), ()> {
+    let h = tm.spawn_blocking_typed(move |pc, ct| {
         pc.update(()).ok();
         mixer_worker(trig_rx, ct);
         Ok(())
-    })
+    });
+    h.cancel_at(ct);
+    h
 }
 
 fn mixer_worker(trig_rx: MixerTrigRx, ct: CancellationToken) {

@@ -137,7 +137,8 @@ impl MrsRpcTrait for RpcEp {
                 }
                 TypedTaskState::Panicked(_)
                 | TypedTaskState::Cancelling
-                | TypedTaskState::Cancelled => Err(TaskManageError::NotFound),
+                | TypedTaskState::Cancelled
+                | TypedTaskState::Invalid => Err(TaskManageError::NotFound),
             }
         } else {
             Err(TaskManageError::NotFound)

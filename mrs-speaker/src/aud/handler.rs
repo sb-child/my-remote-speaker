@@ -100,57 +100,55 @@ fn on_device_online(
 #[instrument(skip_all, fields(device = dev_id_str))]
 fn get_device_status(
     dev_id_str: String,
-    s: Option<TypedTaskState<(), (), DeviceHandlerError>>,
+    status: TypedTaskState<(), (), DeviceHandlerError>,
 ) -> Option<bool> {
-    match s {
-        Some(status) => match status {
-            TypedTaskState::Pending => None,
-            TypedTaskState::Running(_r) => None,
-            TypedTaskState::Completed(_c) => {
-                warn!("Task completed. Will not restart.");
-                None
+    match status {
+        TypedTaskState::Pending => None,
+        TypedTaskState::Running(_r) => None,
+        TypedTaskState::Completed(_c) => {
+            warn!("Task completed. Will not restart.");
+            None
+        }
+        TypedTaskState::Failed(f) => match f.as_ref() {
+            DeviceHandlerError::DeviceUnavailable => {
+                info!("Failed because of unavailable.");
+                Some(false)
             }
-            TypedTaskState::Failed(f) => match f.as_ref() {
-                DeviceHandlerError::DeviceUnavailable => {
-                    info!("Failed because of unavailable.");
+            DeviceHandlerError::DeviceUnsupported => {
+                info!("Failed because of device type unsupported.");
+                Some(true)
+            }
+            DeviceHandlerError::Stream { source } => match source {
+                StreamHandlerError::DeviceDisconnected { source } => {
+                    info!(
+                        "Failed because of disconnected during streaming: {}",
+                        source
+                    );
                     Some(false)
                 }
-                DeviceHandlerError::DeviceUnsupported => {
-                    info!("Failed because of device type unsupported.");
+                StreamHandlerError::FormatUnsupported { source } => {
+                    info!("Failed because of format unsupported: {}", source);
                     Some(true)
                 }
-                DeviceHandlerError::Stream { source } => match source {
-                    StreamHandlerError::DeviceDisconnected { source } => {
-                        info!(
-                            "Failed because of disconnected during streaming: {}",
-                            source
-                        );
-                        Some(false)
-                    }
-                    StreamHandlerError::FormatUnsupported { source } => {
-                        info!("Failed because of format unsupported: {}", source);
-                        Some(true)
-                    }
-                    StreamHandlerError::OtherDeviceError { source } => {
-                        info!("Failed because of other reason: {}", source);
-                        Some(true)
-                    }
-                },
+                StreamHandlerError::OtherDeviceError { source } => {
+                    info!("Failed because of other reason: {}", source);
+                    Some(true)
+                }
             },
-            TypedTaskState::Panicked(p) => {
-                info!("Task panicked. Will not restart: {}", p);
-                None
-            }
-            TypedTaskState::Cancelling => {
-                warn!("Cancelling by TaskManager. Will not restart.");
-                None
-            }
-            TypedTaskState::Cancelled => {
-                warn!("Cancelled by TaskManager. Will not restart.");
-                None
-            }
         },
-        None => {
+        TypedTaskState::Panicked(p) => {
+            info!("Task panicked. Will not restart: {}", p);
+            None
+        }
+        TypedTaskState::Cancelling => {
+            warn!("Cancelling by TaskManager. Will not restart.");
+            None
+        }
+        TypedTaskState::Cancelled => {
+            warn!("Cancelled by TaskManager. Will not restart.");
+            None
+        }
+        TypedTaskState::Invalid => {
             warn!("Deleted by TaskManager. Will not restart.");
             None
         }
@@ -278,7 +276,7 @@ fn device_handler(
         buffer_size: BufferSize::Fixed(256),
     };
     let device_wait_timeout = Duration::from_secs(1);
-    let (mixer, mixer_out) = Mixer::new(tm); // todo，之后会移走
+    let (mixer, mixer_out) = Mixer::new(tm, ct.clone()); // todo，之后会移走
     stream_handler(
         &dev_id.to_string(),
         device,
@@ -371,9 +369,11 @@ fn stream_handler(
             }
             match restart_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(e) => {
+                    warn!("Device disconnected. Restarting device handler: {}", e);
                     return Err(StreamHandlerError::DeviceDisconnected { source: e });
                 }
                 Err(crossfire::RecvTimeoutError::Disconnected) => {
+                    warn!("Error channel disconnected. Restarting stream handler.");
                     break;
                 }
                 Err(crossfire::RecvTimeoutError::Timeout) => {}
