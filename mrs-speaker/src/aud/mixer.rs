@@ -13,7 +13,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// 混音器管理器
 ///
@@ -36,18 +36,20 @@ type MixerTrigRx = crossfire::MRx<
 pub struct Mixer {
     trig_rx: MixerTrigRx,
     worker: Option<TaskHandle<(), (), ()>>,
-    ct: CancellationToken,
+    ct_guard: DropGuard,
 }
 
 impl Mixer {
     pub fn new(tm: &TaskManager, ct: CancellationToken) -> (Self, MixerOutput) {
+        let mixer_ct = ct.child_token();
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
-        let worker = spawn_mixer_worker(tm, trig_rx.clone(), ct.clone());
+        let worker = spawn_mixer_worker(tm, trig_rx.clone(), &mixer_ct);
+        let ct_guard = mixer_ct.drop_guard();
         (
             Self {
                 trig_rx,
                 worker: Some(worker),
-                ct,
+                ct_guard,
             },
             MixerOutput {
                 trig_tx,
@@ -71,7 +73,7 @@ impl Mixer {
         self.worker = Some(spawn_mixer_worker(
             tm,
             self.trig_rx.clone(),
-            self.ct.clone(),
+            self.ct_guard.token(),
         ));
     }
 }
@@ -79,7 +81,7 @@ impl Mixer {
 fn spawn_mixer_worker(
     tm: &TaskManager,
     trig_rx: MixerTrigRx,
-    ct: CancellationToken,
+    ct: &CancellationToken,
 ) -> TaskHandle<(), (), ()> {
     let h = tm.spawn_blocking_typed(move |pc, ct| {
         pc.update(()).ok();

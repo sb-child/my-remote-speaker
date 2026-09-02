@@ -549,8 +549,9 @@ impl TaskManager {
     }
 
     /// 注册触发器，在 ct 触发时取消任务。
-    pub fn cancel_task_at(&self, task_id: TaskId, ct: CancellationToken) {
+    pub fn cancel_task_at(&self, task_id: TaskId, ct: &CancellationToken) {
         let tm = self.clone();
+        let ct = ct.clone();
         tokio::spawn(async move {
             loop {
                 let check = tokio::time::timeout(Duration::from_millis(500), ct.cancelled()).await;
@@ -566,6 +567,7 @@ impl TaskManager {
                     }
                 } else {
                     tm.cancel_task(task_id);
+                    break;
                 }
             }
         });
@@ -619,7 +621,7 @@ where
     }
 
     /// 注册触发器，在 ct 触发时取消任务。
-    pub fn cancel_at(&self, ct: CancellationToken) {
+    pub fn cancel_at(&self, ct: &CancellationToken) {
         self.tm.cancel_task_at(self.id, ct);
     }
 }

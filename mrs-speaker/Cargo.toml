@@ -43,5 +43,5 @@ chrono = "0.4.45"
 
 [features]
 default = ["use-pipewire"]
-use-pipewire = ["dep:pipewire", "cpal/pipewire", "cpal/realtime"]
+use-pipewire = ["dep:pipewire", "cpal/pipewire"]
 android = ["dep:ndk-context", "dep:jni"]
