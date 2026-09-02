@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use futures_util::FutureExt;
+use serde::{Deserialize, Serialize};
 use std::{
     any::Any,
     fmt,
@@ -14,7 +15,22 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub type TaskId = u64;
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskId(u64);
+
+struct AtomicTaskId(AtomicU64);
+
+impl Default for AtomicTaskId {
+    fn default() -> Self {
+        Self(AtomicU64::new(1))
+    }
+}
+
+impl AtomicTaskId {
+    fn next(&self) -> TaskId {
+        TaskId(self.0.fetch_add(1, Ordering::SeqCst))
+    }
+}
 
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -285,7 +301,7 @@ impl Drop for TaskGuard {
 
 #[derive(Clone, Default)]
 pub struct TaskManager {
-    next_id: Arc<AtomicU64>,
+    task_id_counter: Arc<AtomicTaskId>,
     closed: Arc<AtomicBool>,
     tasks: Arc<DashMap<TaskId, TaskState>>,
     handles: HandleMap,
@@ -294,7 +310,7 @@ pub struct TaskManager {
 impl TaskManager {
     pub fn new() -> Self {
         Self {
-            next_id: Arc::new(AtomicU64::new(1)),
+            task_id_counter: Arc::new(AtomicTaskId::default()),
             closed: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(DashMap::new()),
             handles: Arc::new(DashMap::new()),
@@ -332,7 +348,7 @@ impl TaskManager {
         T: Send + Sync + 'static,
         E: Send + Sync + 'static,
     {
-        let task_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let task_id = self.task_id_counter.next();
         if self.closed.load(Ordering::SeqCst) {
             self.tasks.insert(task_id, TaskState::Cancelled);
             let tasks = Arc::clone(&self.tasks);
@@ -408,7 +424,7 @@ impl TaskManager {
         T: Send + Sync + 'static,
         E: Send + Sync + 'static,
     {
-        let task_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let task_id = self.task_id_counter.next();
         if self.closed.load(Ordering::SeqCst) {
             self.tasks.insert(task_id, TaskState::Cancelled);
             let tasks = Arc::clone(&self.tasks);

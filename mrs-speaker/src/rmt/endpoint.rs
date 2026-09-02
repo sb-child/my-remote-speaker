@@ -105,7 +105,7 @@ impl MrsRpcTrait for RpcEp {
         self,
         _context: ::tarpc::context::Context,
         sample_ticket: BlobTicket,
-    ) -> u64 {
+    ) -> TaskId {
         let ep = self.ctx.endpoint;
         let ss = self.ctx.sample_store;
         let tid = self
