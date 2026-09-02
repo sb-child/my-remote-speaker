@@ -583,3 +583,286 @@ where
         self.tm.cancel_task_at(self.id, ct);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 轮询直到 cond 为 true 或超时
+    async fn wait_until(cond: impl Fn() -> bool, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    type Status = u32;
+    type Ret = i32;
+    type Err = String;
+
+    fn mk_tm() -> TaskManager {
+        TaskManager::new()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_task_completes() {
+        let tm = mk_tm();
+        let h =
+            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(42) });
+        assert!(
+            wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
+            "task should complete, got {:?}",
+            h.status()
+        );
+        match h.status() {
+            TypedTaskState::Completed(v) => assert_eq!(*v, 42),
+            s => panic!("unexpected state: {:?}", s),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_task_fails() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            Err::<Ret, Err>("boom".to_string())
+        });
+        assert!(
+            wait_until(|| h.status().is_failed(), Duration::from_secs(2)).await,
+            "task should fail, got {:?}",
+            h.status()
+        );
+        match h.status() {
+            TypedTaskState::Failed(e) => assert_eq!(e.as_str(), "boom"),
+            s => panic!("unexpected state: {:?}", s),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_task_panics() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            panic!("async panic payload");
+            #[allow(unreachable_code)]
+            Ok::<Ret, Err>(0)
+        });
+        assert!(
+            wait_until(|| h.status().is_panicked(), Duration::from_secs(2)).await,
+            "task should panic, got {:?}",
+            h.status()
+        );
+        match h.status() {
+            TypedTaskState::Panicked(msg) => assert!(msg.contains("async panic payload")),
+            s => panic!("unexpected state: {:?}", s),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_task_completes_and_panics() {
+        let tm = mk_tm();
+        let h = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, _ct| Ok::<Ret, Err>(7));
+        assert!(
+            wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
+            "blocking task should complete, got {:?}",
+            h.status()
+        );
+        match h.status() {
+            TypedTaskState::Completed(v) => assert_eq!(*v, 7),
+            s => panic!("unexpected state: {:?}", s),
+        }
+
+        let hp = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, _ct| {
+            panic!("blocking panic payload");
+            #[allow(unreachable_code)]
+            Ok::<Ret, Err>(0)
+        });
+        assert!(
+            wait_until(|| hp.status().is_panicked(), Duration::from_secs(2)).await,
+            "blocking task should panic, got {:?}",
+            hp.status()
+        );
+        match hp.status() {
+            TypedTaskState::Panicked(msg) => assert!(msg.contains("blocking panic payload")),
+            s => panic!("unexpected state: {:?}", s),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_pending_to_running_and_update() {
+        let tm = mk_tm();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, _ct| async move {
+            pc.update(1); // Pending -> Running（回归测试 alter 修复）
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pc.update(2); // 覆盖 Running 值
+            // 等主测试观察到 Running(2) 后再退出
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+            Ok::<Ret, Err>(0)
+        });
+        // 第一次 update 后应是 Running(1)
+        assert!(
+            wait_until(
+                || matches!(h.status(), TypedTaskState::Running(v) if *v == 1),
+                Duration::from_secs(2)
+            )
+            .await,
+            "should become Running(1), got {:?}",
+            h.status()
+        );
+        // 第二次 update 后应是 Running(2)，且任务还在运行
+        assert!(
+            wait_until(
+                || matches!(h.status(), TypedTaskState::Running(v) if *v == 2),
+                Duration::from_secs(2)
+            )
+            .await,
+            "should update Running value to 2, got {:?}",
+            h.status()
+        );
+        // 放行任务完成，终态保留
+        let _ = release_tx.send(());
+        done_rx.await.unwrap();
+        assert!(
+            wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
+            "task should complete, got {:?}",
+            h.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progress_does_not_override_cancelling() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, ct| async move {
+            pc.update(1);
+            ct.cancelled().await; // 等 cancel_task 把状态置为 Cancelling
+            pc.update(2); // 必须被 alter 拒绝（不覆盖 Cancelling）
+            Ok::<Ret, Err>(0)
+        });
+        assert!(
+            wait_until(
+                || matches!(h.status(), TypedTaskState::Running(v) if *v == 1),
+                Duration::from_secs(2)
+            )
+            .await,
+            "should reach Running(1), got {:?}",
+            h.status()
+        );
+        h.cancel();
+        // 最终应该是 Cancelled 而非 Running(2)/Completed
+        assert!(
+            wait_until(|| h.status().is_cancelled(), Duration::from_secs(3)).await,
+            "should end Cancelled, got {:?}",
+            h.status()
+        );
+        assert!(
+            !matches!(h.status(), TypedTaskState::Running(v) if *v == 2),
+            "late progress must not override cancellation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooperative_cancel_async() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, ct| async move {
+            while !ct.is_cancelled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<Ret, Err>(1)
+        });
+        h.cancel();
+        assert!(
+            wait_until(|| h.status().is_cancelled(), Duration::from_secs(3)).await,
+            "should be Cancelled, got {:?}",
+            h.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "takes ~5s due to cancel_task abort timeout"]
+    async fn cancel_aborts_unresponsive_async() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            // 不响应 ct：挂起 1 小时，必须被 abort 干掉
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok::<Ret, Err>(1)
+        });
+        h.cancel();
+        assert!(
+            wait_until(|| h.status().is_cancelled(), Duration::from_secs(8)).await,
+            "unresponsive task should be aborted to Cancelled, got {:?}",
+            h.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooperative_cancel_blocking() {
+        let tm = mk_tm();
+        let h = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, ct| {
+            while !ct.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok::<Ret, Err>(1)
+        });
+        h.cancel();
+        assert!(
+            wait_until(|| h.status().is_cancelled(), Duration::from_secs(3)).await,
+            "blocking task should be Cancelled, got {:?}",
+            h.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_after_close_immediately_cancelled() {
+        let tm = mk_tm();
+        tm.close();
+        let h =
+            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(1) });
+        assert!(
+            wait_until(|| h.status().is_cancelled(), Duration::from_secs(2)).await,
+            "task spawned after close should be Cancelled, got {:?}",
+            h.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_at_triggers_cancel() {
+        let tm = mk_tm();
+        let ct = CancellationToken::new();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, task_ct| async move {
+            tokio::select! {
+                _ = task_ct.cancelled() => {}
+                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            }
+            Ok::<Ret, Err>(1)
+        });
+        h.cancel_at(&ct);
+        // 等 watcher 注册后触发
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ct.cancel();
+        assert!(
+            wait_until(|| h.status().is_cancelled(), Duration::from_secs(3)).await,
+            "cancel_at should cancel task, got {:?}",
+            h.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_status_removes_handle_after_terminal() {
+        let tm = mk_tm();
+        let h =
+            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(3) });
+        assert!(
+            wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
+            "task should complete"
+        );
+        // terminal 后 cancel 不应改变状态（handles 已清理，取消视为 no-op）
+        h.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(h.status().is_completed(), "terminal state must be sticky");
+    }
+}
