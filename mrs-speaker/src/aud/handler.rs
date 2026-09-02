@@ -309,7 +309,7 @@ fn stream_handler(
         mixer_out.reset();
         let mo = mixer_out.clone();
         let mo2 = mixer_out.clone();
-        let (restart_tx, restart_rx) = crossfire::oneshot::oneshot();
+        let (restart_tx, restart_rx) = crossfire::mpsc::bounded_blocking(16);
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
         let stream_res = if support_f32 {
@@ -325,7 +325,7 @@ fn stream_handler(
                         &mo,
                     );
                 },
-                |e| stream_error_callback(e, mo2, restart_tx),
+                move |e| stream_error_callback(e, &mo2, &restart_tx),
                 Some(device_wait_timeout),
             )
         } else {
@@ -341,7 +341,7 @@ fn stream_handler(
                         &mo,
                     );
                 },
-                |e| stream_error_callback(e, mo2, restart_tx),
+                move |e| stream_error_callback(e, &mo2, &restart_tx),
                 Some(device_wait_timeout),
             )
         };
@@ -374,7 +374,7 @@ fn stream_handler(
                     return Err(StreamHandlerError::DeviceDisconnected { source: e });
                 }
                 Err(crossfire::RecvTimeoutError::Disconnected) => {
-                    return Err(StreamHandlerError::DeviceDisconnected { source: e });
+                    break;
                 }
                 Err(crossfire::RecvTimeoutError::Timeout) => {}
             };
@@ -386,13 +386,13 @@ fn stream_handler(
         // wait for CancellationToken
         // wait any err_cb error happens
     }
-    Ok(())
+    // Ok(())
 }
 
 fn stream_error_callback(
     err: cpal::Error,
-    mo: MixerOutput,
-    restart_tx: crossfire::oneshot::TxOneshot<cpal::Error>,
+    mo: &MixerOutput,
+    restart_tx: &crossfire::MTx<crossfire::mpsc::Array<cpal::Error>>,
 ) {
     match err.kind() {
         cpal::ErrorKind::DeviceBusy
@@ -405,7 +405,7 @@ fn stream_error_callback(
         | cpal::ErrorKind::Other => {
             // restart
             mo.disconnected();
-            restart_tx.send(err);
+            restart_tx.send(err).ok();
         }
         _ => {
             // ignore

@@ -135,10 +135,10 @@ impl MixerOutput {
 
     /// 在 stream 掉线时调用
     pub fn disconnected(&self) {
-        self.disconnect_at.store(Instant::now(), Ordering::Release);
         if self.disconnected.swap(true, Ordering::Release) {
             return; // 只记录第一次断开连接时间
         }
+        self.disconnect_at.store(Instant::now(), Ordering::Release);
     }
 
     pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
