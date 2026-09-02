@@ -375,7 +375,7 @@ impl TaskManager {
                 }
             };
             tasks_for_result.alter(&task_id, |_k, v| {
-                match v.is_cancelling() | v.is_cancelled() {
+                match v.is_cancelling() || v.is_cancelled() {
                     true => v,
                     false => terminal_state,
                 }
@@ -445,7 +445,7 @@ impl TaskManager {
                 }
             };
             tasks_for_result.alter(&task_id, |_k, v| {
-                match v.is_cancelling() | v.is_cancelled() {
+                match v.is_cancelling() || v.is_cancelled() {
                     true => v,
                     false => terminal_state,
                 }
