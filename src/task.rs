@@ -244,7 +244,7 @@ type HandleMap = Arc<
         (
             JoinHandle<()>,
             CancellationToken,
-            crossfire::MAsyncRx<crossfire::mpmc::Null>,
+            Option<crossfire::MAsyncRx<crossfire::mpmc::Null>>, // blocking only
         ),
     >,
 >;
@@ -350,7 +350,6 @@ impl TaskManager {
             task_id,
             _phantom: PhantomData,
         };
-        let (death_tx, death_rx) = crossfire::mpmc::Null::new().new_async();
         self.tasks.insert(task_id, TaskState::Pending);
         let tasks_for_result = self.tasks.clone();
         let handles_ref = self.handles.clone();
@@ -361,11 +360,9 @@ impl TaskManager {
                 handles: handles_ref,
                 ttl: Duration::from_secs(60),
             };
-            let _death_tx = death_tx;
             let res =
                 FutureExt::catch_unwind(AssertUnwindSafe(async { f(progress, task_token).await }))
                     .await;
-
             let terminal_state = match res {
                 Ok(Ok(val)) => TaskState::Completed(Arc::new(val)),
                 Ok(Err(err)) => TaskState::Failed(Arc::new(err)),
@@ -381,8 +378,7 @@ impl TaskManager {
                 }
             });
         });
-        self.handles
-            .insert(task_id, (worker_handle, token, death_rx));
+        self.handles.insert(task_id, (worker_handle, token, None));
         if self.closed.load(Ordering::SeqCst) {
             self.cancel_task(task_id);
         } else if let Some(state) = self.tasks.get(&task_id) {
@@ -452,7 +448,7 @@ impl TaskManager {
             });
         });
         self.handles
-            .insert(task_id, (worker_handle, token, death_rx));
+            .insert(task_id, (worker_handle, token, Some(death_rx)));
         if self.closed.load(Ordering::SeqCst) {
             self.cancel_task(task_id);
         } else if let Some(state) = self.tasks.get(&task_id) {
@@ -485,16 +481,22 @@ impl TaskManager {
         } else {
             return;
         }
-        if let Some((_, (handle, token, death_rx))) = self.handles.remove(&task_id) {
+        if let Some((_, (mut handle, token, death_rx))) = self.handles.remove(&task_id) {
             token.cancel();
             let tasks = self.tasks.clone();
             tokio::spawn(async move {
-                let graceful_exit =
-                    tokio::time::timeout(Duration::from_secs(5), &mut death_rx.recv()).await;
+                let graceful_exit = tokio::time::timeout(Duration::from_secs(5), async {
+                    match death_rx.as_ref() {
+                        Some(rx) => drop(&mut rx.recv().await), // drop() just reduced 2 lines.
+                        None => drop((&mut handle).await),
+                    }
+                })
+                .await;
                 if graceful_exit.is_err() {
                     handle.abort(); // async task only
-                    // 如果task还没死就一直等着
-                    let _ = death_rx.recv().await;
+                    if let Some(rx) = death_rx.as_ref() {
+                        let _ = rx.recv().await; // blocking task only
+                    }
                     let _ = handle.await;
                 }
                 if let Some(mut state) = tasks.get_mut(&task_id) {
