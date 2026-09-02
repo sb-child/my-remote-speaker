@@ -96,7 +96,7 @@ fn spawn_mixer_worker(
     ct: &CancellationToken,
 ) -> TaskHandle<(), (), ()> {
     let h = tm.spawn_blocking_typed(move |pc, ct| {
-        pc.update(()).ok();
+        pc.update(());
         mixer_worker(trig_rx, cmd_rx, ct);
         Ok(())
     });

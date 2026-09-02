@@ -7,7 +7,7 @@ use my_remote_speaker::{
         MrsRpcTrait, QuerySampleError, RemoveSampleError, SampleInfo, StoreSampleError,
         StoreSampleProgress, StoreSampleTaskState, TaskManageError,
     },
-    task::{ProgressChannel, TaskId, TypedTaskState},
+    task::{ProgressUpdater, TaskId, TypedTaskState},
 };
 use surrealkv::Tree;
 use tarpc::{
@@ -50,12 +50,10 @@ async fn store_audio_sample_task(
     ticket: BlobTicket,
     ep: Endpoint,
     ss: Tree,
-    stat: ProgressChannel<StoreSampleProgress>,
+    stat: ProgressUpdater<StoreSampleProgress>,
     _ct: CancellationToken,
 ) -> Result<(), StoreSampleError> {
-    stat.update_async(StoreSampleProgress::CheckingDatabase)
-        .await
-        .unwrap();
+    stat.update(StoreSampleProgress::CheckingDatabase);
     let mut tx = ss
         .begin()
         .map_err(|e| StoreSampleError::DatabaseError(e.to_string()))?;
@@ -66,18 +64,14 @@ async fn store_audio_sample_task(
     if let Some(_) = db_result {
         return Err(StoreSampleError::SampleExists);
     }
-    stat.update_async(StoreSampleProgress::DownloadingSample)
-        .await
-        .unwrap();
+    stat.update(StoreSampleProgress::DownloadingSample);
     let memstore = MemStore::new();
     let downloader = memstore.downloader(&ep);
     downloader
         .download(ticket.hash(), Some(ticket.addr().id))
         .await
         .map_err(|e| StoreSampleError::TicketNotReached(e.to_string()))?;
-    stat.update_async(StoreSampleProgress::ReadingBlob)
-        .await
-        .unwrap();
+    stat.update(StoreSampleProgress::ReadingBlob);
     // should not be an error
     let mut reader = memstore.blobs().reader(ticket.hash());
     let mut buffer = Vec::new();
@@ -85,13 +79,9 @@ async fn store_audio_sample_task(
         .read_to_end(&mut buffer)
         .await
         .map_err(|e| StoreSampleError::TicketNotReached(e.to_string()))?;
-    stat.update_async(StoreSampleProgress::CheckingSampleData)
-        .await
-        .unwrap();
+    stat.update(StoreSampleProgress::CheckingSampleData);
     // todo: 检查sample数据
-    stat.update_async(StoreSampleProgress::CommittingDatabase)
-        .await
-        .unwrap();
+    stat.update(StoreSampleProgress::CommittingDatabase);
     tx.set(&hash_bytes, &buffer)
         .map_err(|e| StoreSampleError::DatabaseError(e.to_string()))?;
     tx.commit()

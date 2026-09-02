@@ -35,7 +35,7 @@ fn on_device_add(
     let dev_id_2 = dev_id.clone();
     let tm2 = tm.clone();
     let h = tm.spawn_blocking_typed(move |tc, ct| {
-        tc.update(()).ok(); // todo
+        tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, (), ct, &tm2)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
@@ -82,7 +82,7 @@ fn on_device_online(
     let dev_id_2 = dev_id.clone();
     let tm2 = tm.clone();
     let h = tm.spawn_blocking_typed(move |tc, ct| {
-        tc.update(()).ok(); // todo
+        tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, (), ct, &tm2)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
