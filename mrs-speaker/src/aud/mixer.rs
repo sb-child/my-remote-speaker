@@ -16,8 +16,8 @@ use std::{
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
 type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
+type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
 
 /// 混音器管理器
 ///
@@ -137,34 +137,34 @@ fn select_mixer_channel(
         match trig_rx.read_select(res) {
             Ok((size, r)) => {
                 if let Some(frame_tx) = r {
-                    let buf = mix_tracks(size);
+                    let buf = mixer_mix_tracks(size);
                     // 如果 frame_rx 被 drop，这里发送的 buf 会自动 drop。
                     frame_tx.send(buf);
                 } else {
-                    seek_tracks(size);
+                    mixer_seek_tracks(size);
                 }
             }
             Err(RecvError) => sel.remove(trig_rx),
         }
     } else if res == *cmd_rx {
         match cmd_rx.read_select(res) {
-            Ok(cmd) => handle_mixer_cmd(cmd),
+            Ok(cmd) => mixer_handle_cmd(cmd),
             Err(RecvError) => sel.remove(cmd_rx),
         }
     }
 }
 
-fn mix_tracks(items: usize) -> Vec<f32> {
+fn mixer_mix_tracks(items: usize) -> Vec<f32> {
     let buf = Vec::new();
     // todo: mix tracks
     buf
 }
 
-fn seek_tracks(items: usize) {
+fn mixer_seek_tracks(items: usize) {
     // todo
 }
 
-fn handle_mixer_cmd(cmd: MixerCmd) {
+fn mixer_handle_cmd(cmd: MixerCmd) {
     // todo
 }
 

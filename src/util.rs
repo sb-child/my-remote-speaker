@@ -85,24 +85,34 @@ impl AtomicInstant {
 }
 
 pub use pastey::paste;
+pub use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
+/// 创建 ID 结构体。
+/// - `gen_id!(Task);` -> `pub TaskId`, `priv TaskIdCounter`
+/// - `gen_id!(Task, counter: pub);` -> `pub TaskId`, `pub TaskIdCounter`
+/// - `gen_id!(pub(crate) Task);` -> `pub(crate) TaskId`, `priv TaskIdCounter`
+/// - `gen_id!(pub(crate) Task, counter: pub(super));` -> `pub(crate) TaskId`, `pub(super) TaskIdCounter`
 #[macro_export]
 macro_rules! use_id {
-    ($name:ident) => {
+    (@impl ($($id_vis:tt)*) ($($counter_vis:tt)*) $name:ident) => {
         $crate::util::paste! {
-            #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-            pub struct [<$name Id>](pub u64);
-            pub struct [<$name IdCounter>](pub std::sync::atomic::AtomicU64);
-            impl Default for [<$name IdCounter>] {
-                fn default() -> Self {
-                    Self(std::sync::atomic::AtomicU64::new(1))
-                }
-            }
+            #[derive(
+                Debug, Clone, Copy, Hash, PartialEq, Eq,
+                $crate::util::SerdeSerialize,
+                $crate::util::SerdeDeserialize
+            )]
+            $($id_vis)* struct [<$name Id>](pub u64);
+            impl From<u64> for [<$name Id>] { fn from(value: u64) -> Self { Self(value) } }
+            impl Into<u64> for [<$name Id>] { fn into(self) -> u64 { self.0 } }
+            $($counter_vis)* struct [<$name IdCounter>](std::sync::atomic::AtomicU64);
+            impl Default for [<$name IdCounter>] { fn default() -> Self { Self(std::sync::atomic::AtomicU64::new(1)) } }
             impl [<$name IdCounter>] {
-                pub fn next(&self) -> [<$name Id>] {
-                    [<$name Id>](self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
-                }
+                pub fn next(&self) -> [<$name Id>] { [<$name Id>](self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) }
             }
         }
     };
+    ($name:ident, counter: $counter_vis:vis) => { $crate::use_id!(@impl (pub) ($counter_vis) $name); };
+    ($id_vis:vis $name:ident, counter: $counter_vis:vis) => { $crate::use_id!(@impl ($id_vis) ($counter_vis) $name); };
+    ($name:ident) => { $crate::use_id!(@impl (pub) () $name); };
+    ($id_vis:vis $name:ident) => { crate::use_id!(@impl ($id_vis) () $name); };
 }
