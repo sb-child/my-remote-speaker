@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::aud::{
-    SAMPLE_RATE, dcblocker::DcBlocker, mixer::{Mixer, MixerOutput},
+    SAMPLE_RATE,
+    dcblocker::DcBlocker,
+    mixer::{Mixer, MixerOutput},
 };
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
@@ -304,9 +306,10 @@ fn stream_handler(
 ) -> Result<(), StreamHandlerError> {
     loop {
         info!("Building output stream...");
+        mixer_out.reset();
         let mo = mixer_out.clone();
-        mo.reset();
-        let err_cb = |err: cpal::Error| {};
+        let mo2 = mixer_out.clone();
+        let (restart_tx, restart_rx) = crossfire::oneshot::oneshot();
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
         let stream_res = if support_f32 {
@@ -322,7 +325,7 @@ fn stream_handler(
                         &mo,
                     );
                 },
-                err_cb,
+                |e| stream_error_callback(e, mo2, restart_tx),
                 Some(device_wait_timeout),
             )
         } else {
@@ -338,7 +341,7 @@ fn stream_handler(
                         &mo,
                     );
                 },
-                err_cb,
+                |e| stream_error_callback(e, mo2, restart_tx),
                 Some(device_wait_timeout),
             )
         };
@@ -365,11 +368,17 @@ fn stream_handler(
             if ct.is_cancelled() {
                 warn!("Cancelled.");
                 return Ok(());
-            } else {
-                thread::sleep(Duration::from_secs(1));
             }
+            match restart_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(e) => {
+                    return Err(StreamHandlerError::DeviceDisconnected { source: e });
+                }
+                Err(crossfire::RecvTimeoutError::Disconnected) => {
+                    return Err(StreamHandlerError::DeviceDisconnected { source: e });
+                }
+                Err(crossfire::RecvTimeoutError::Timeout) => {}
+            };
         }
-
         // todo:
         // wait for mixer commands
         // call dc_blocker_handle.reset() after stream.pause()
@@ -378,6 +387,30 @@ fn stream_handler(
         // wait any err_cb error happens
     }
     Ok(())
+}
+
+fn stream_error_callback(
+    err: cpal::Error,
+    mo: MixerOutput,
+    restart_tx: crossfire::oneshot::TxOneshot<cpal::Error>,
+) {
+    match err.kind() {
+        cpal::ErrorKind::DeviceBusy
+        | cpal::ErrorKind::DeviceNotAvailable
+        | cpal::ErrorKind::HostUnavailable
+        | cpal::ErrorKind::PermissionDenied
+        | cpal::ErrorKind::ResourceExhausted
+        | cpal::ErrorKind::StreamInvalidated
+        | cpal::ErrorKind::BackendError
+        | cpal::ErrorKind::Other => {
+            // restart
+            mo.disconnected();
+            restart_tx.send(err);
+        }
+        _ => {
+            // ignore
+        }
+    };
 }
 
 fn stream_callback_convertor_f32(
