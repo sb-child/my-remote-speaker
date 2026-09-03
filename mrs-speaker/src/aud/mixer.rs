@@ -14,7 +14,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::{
+    bytes::buf,
+    sync::{CancellationToken, DropGuard},
+};
 
 type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
@@ -34,6 +37,11 @@ pub enum MixerCmd {
 type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
 type MixerCmdRx = crossfire::MRx<crossfire::mpmc::Array<MixerCmd>>;
 
+enum MixerTriggerPayload {
+    Seek(usize),
+    Read(usize, Option<OneshotTx<Vec<f32>>>),
+}
+
 type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>;
 
 /// 混音器
@@ -47,12 +55,20 @@ pub struct Mixer {
 }
 
 impl Mixer {
-    pub fn new(tm: &TaskManager, ct: CancellationToken) -> (Self, MixerHandle, MixerOutput) {
+    pub fn new(
+        tm: &TaskManager,
+        ct: CancellationToken,
+    ) -> (Self, MixerHandle, MixerController, MixerOutput) {
         let mixer_ct = ct.child_token();
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
         let (cmd_tx, cmd_rx) = crossfire::mpmc::bounded_blocking(16);
         let worker = spawn_mixer_worker(tm, trig_rx.clone(), cmd_rx.clone(), &mixer_ct);
         let ct_guard = mixer_ct.drop_guard();
+        let state = Arc::new(MixerLinkState {
+            read_frames_errored: Default::default(),
+            disconnected: Default::default(),
+            disconnect_at: AtomicInstant::new(Instant::now()).into(),
+        });
         (
             Self {
                 cmd_rx,
@@ -61,11 +77,13 @@ impl Mixer {
                 ct_guard,
             },
             MixerHandle { cmd_tx },
+            MixerController {
+                state: state.clone(),
+            },
             MixerOutput {
                 trig_tx,
-                read_frames_errored: Default::default(),
-                disconnected: Default::default(),
-                disconnect_at: AtomicInstant::new(Instant::now()).into(),
+                buf: None,
+                state,
             },
         )
     }
@@ -167,38 +185,57 @@ pub struct MixerHandle {
     cmd_tx: MixerCmdTx,
 }
 
-/// 设计上只允许一个线程读取，不要并发读。
 #[derive(Clone)]
-pub struct MixerOutput {
-    trig_tx: crossfire::MTx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>,
-    read_frames_errored: Arc<AtomicBool>,
-    disconnected: Arc<AtomicBool>,
-    disconnect_at: Arc<AtomicInstant>,
+pub struct MixerController {
+    state: Arc<MixerLinkState>,
 }
 
-impl MixerOutput {
+impl MixerController {
     pub fn reset(&self) {
-        self.read_frames_errored.store(false, Ordering::Relaxed);
+        self.state
+            .read_frames_errored
+            .store(false, Ordering::Relaxed);
     }
 
     /// 在 stream 掉线时调用
     pub fn disconnected(&self) {
-        if self.disconnected.swap(true, Ordering::Release) {
+        if self.state.disconnected.swap(true, Ordering::Release) {
             return; // 只记录第一次断开连接时间
         }
-        self.disconnect_at.store(Instant::now(), Ordering::Release);
+        self.state
+            .disconnect_at
+            .store(Instant::now(), Ordering::Release);
     }
+}
 
-    pub fn read_frames(&self, data: &mut [f32], timeout: Duration) -> usize {
+/// 设计上只允许一个线程读取，不要并发读。
+pub struct MixerOutput {
+    trig_tx: crossfire::MTx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>,
+    buf: Option<Vec<f32>>,
+    state: Arc<MixerLinkState>,
+}
+
+impl Clone for MixerOutput {
+    fn clone(&self) -> Self {
+        Self {
+            trig_tx: self.trig_tx.clone(),
+            buf: None,
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl MixerOutput {
+    pub fn read_frames(&mut self, data: &mut [f32], timeout: Duration) -> usize {
         let mut time_left = timeout;
         // let mut start_at = Instant::now();
-        if self.read_frames_errored.load(Ordering::Relaxed) {
+        if self.state.read_frames_errored.load(Ordering::Relaxed) {
             return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
         }
-        let trig_at = if self.disconnected.load(Ordering::Acquire) {
+        let trig_at = if self.state.disconnected.load(Ordering::Acquire) {
             // 断开的时间
             let skip_at = Instant::now();
-            let dur = skip_at.duration_since(self.disconnect_at.load(Ordering::Acquire));
+            let dur = skip_at.duration_since(self.state.disconnect_at.load(Ordering::Acquire));
             // 2 channel * 48000 Hz * seconds
             let skip_items = 2 * (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
             // 快进 buffer
@@ -209,10 +246,12 @@ impl MixerOutput {
                     return 0;
                 }
                 Err(SendTimeoutError::Disconnected(_v)) => {
-                    self.read_frames_errored.store(true, Ordering::Relaxed);
+                    self.state
+                        .read_frames_errored
+                        .store(true, Ordering::Relaxed);
                     return 0;
                 }
-                _ => self.disconnected.store(false, Ordering::Release),
+                _ => self.state.disconnected.store(false, Ordering::Release),
             }
             let trig_at = Instant::now();
             time_left = time_left.saturating_sub(trig_at.saturating_duration_since(skip_at));
@@ -233,7 +272,9 @@ impl MixerOutput {
                 return 0;
             }
             Err(SendTimeoutError::Disconnected(_v)) => {
-                self.read_frames_errored.store(true, Ordering::Relaxed);
+                self.state
+                    .read_frames_errored
+                    .store(true, Ordering::Relaxed);
                 return 0; // mixer 死了
             }
             _ => (),
@@ -250,11 +291,19 @@ impl MixerOutput {
                 0 // mixer_worker 响应超时
             }
             Err(RecvTimeoutError::Disconnected) => {
-                self.read_frames_errored.store(true, Ordering::Relaxed);
+                self.state
+                    .read_frames_errored
+                    .store(true, Ordering::Relaxed);
                 0 // mixer 死了
             }
         }
     }
+}
+
+struct MixerLinkState {
+    read_frames_errored: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_at: Arc<AtomicInstant>,
 }
 
 /// 音频轨道

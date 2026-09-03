@@ -20,7 +20,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::aud::{
     SAMPLE_RATE,
     dcblocker::DcBlocker,
-    mixer::{Mixer, MixerOutput},
+    mixer::{Mixer, MixerController, MixerOutput},
 };
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
@@ -276,7 +276,7 @@ fn device_handler(
         buffer_size: BufferSize::Fixed(256),
     };
     let device_wait_timeout = Duration::from_secs(1);
-    let (mixer, mixer_handle, mixer_out) = Mixer::new(tm, ct.clone()); // todo，之后会移走
+    let (mixer, mixer_handle, mixer_ctrl, mixer_out) = Mixer::new(tm, ct.clone()); // todo，之后会移走
     stream_handler(
         &dev_id.to_string(),
         device,
@@ -284,6 +284,7 @@ fn device_handler(
         device_wait_timeout,
         support_2ch,
         support_f32,
+        mixer_ctrl,
         mixer_out,
         ct,
     )
@@ -299,14 +300,16 @@ fn stream_handler(
     device_wait_timeout: Duration,
     support_2ch: bool,
     support_f32: bool,
+    mixer_ctrl: MixerController,
     mixer_out: MixerOutput,
     ct: CancellationToken,
 ) -> Result<(), StreamHandlerError> {
     loop {
         info!("Building output stream...");
-        mixer_out.reset();
-        let mo = mixer_out.clone();
-        let mo2 = mixer_out.clone();
+        mixer_ctrl.reset();
+        let mc_for_err_cb = mixer_ctrl.clone();
+        let mut mo_for_stream_cb = mixer_out.clone();
+        // let mo_for_err_cb = mixer_out.clone();
         let (restart_tx, restart_rx) = crossfire::mpsc::bounded_blocking(16);
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
@@ -320,10 +323,10 @@ fn stream_handler(
                         &mut temp_buf,
                         &mut dc_blocker,
                         support_2ch,
-                        &mo,
+                        &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(e, &mo2, &restart_tx),
+                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx),
                 Some(device_wait_timeout),
             )
         } else {
@@ -336,10 +339,10 @@ fn stream_handler(
                         &mut temp_buf,
                         &mut dc_blocker,
                         support_2ch,
-                        &mo,
+                        &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(e, &mo2, &restart_tx),
+                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx),
                 Some(device_wait_timeout),
             )
         };
@@ -391,7 +394,7 @@ fn stream_handler(
 
 fn stream_error_callback(
     err: cpal::Error,
-    mo: &MixerOutput,
+    mc: &MixerController,
     restart_tx: &crossfire::MTx<crossfire::mpsc::Array<cpal::Error>>,
 ) {
     match err.kind() {
@@ -404,7 +407,7 @@ fn stream_error_callback(
         | cpal::ErrorKind::BackendError
         | cpal::ErrorKind::Other => {
             // restart
-            mo.disconnected();
+            mc.disconnected();
             restart_tx.send(err).ok();
         }
         _ => {
@@ -419,7 +422,7 @@ fn stream_callback_convertor_f32(
     temp_buf: &mut Vec<f32>,
     dc_blocker: &mut DcBlocker,
     support_2ch: bool,
-    mixer_out: &MixerOutput,
+    mixer_out: &mut MixerOutput,
 ) -> () {
     if support_2ch {
         // build_output_stream docs: The slice is pre-filled with silence.
@@ -440,7 +443,7 @@ fn stream_callback_convertor_i16(
     temp_buf: &mut Vec<f32>,
     dc_blocker: &mut DcBlocker,
     support_2ch: bool,
-    mixer_out: &MixerOutput,
+    mixer_out: &mut MixerOutput,
 ) -> () {
     if support_2ch {
         let target_len = data.len();
@@ -465,7 +468,7 @@ fn stream_callback_handler(
     data: &mut [f32],
     cbi: &OutputCallbackInfo,
     dc_blocker: &mut DcBlocker,
-    mixer_out: &MixerOutput,
+    mixer_out: &mut MixerOutput,
 ) {
     // read frames from mixer
     let t = cbi.timestamp();
