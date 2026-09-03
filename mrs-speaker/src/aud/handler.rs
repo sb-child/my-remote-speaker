@@ -37,7 +37,7 @@ fn on_device_add(
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, desc.as_ref());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
-    let h = tm.spawn_blocking_typed(move |tc, ct| {
+    let h = tm.spawn_blocking_typed(move |_tm, tc, ct| {
         tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
     });
@@ -89,7 +89,7 @@ fn on_device_online(
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, description.as_ref());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
-    let h = tm.spawn_blocking_typed(move |tc, ct| {
+    let h = tm.spawn_blocking_typed(move |_tm, tc, ct| {
         tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
     });

@@ -455,7 +455,7 @@ impl TaskManager {
 
     pub fn spawn_typed<F, Fut, Status, Ret, Err>(&self, f: F) -> TaskHandle<Status, Ret, Err>
     where
-        F: FnOnce(ProgressUpdater<Status>, CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(TaskManager, ProgressUpdater<Status>, CancellationToken) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Ret, Err>> + Send + 'static,
         Status: Send + Sync + 'static + Unpin,
         Ret: Send + Sync + 'static,
@@ -467,7 +467,9 @@ impl TaskManager {
 
     pub fn spawn_blocking_typed<F, Status, Ret, Err>(&self, f: F) -> TaskHandle<Status, Ret, Err>
     where
-        F: FnOnce(ProgressUpdater<Status>, CancellationToken) -> Result<Ret, Err> + Send + 'static,
+        F: FnOnce(TaskManager, ProgressUpdater<Status>, CancellationToken) -> Result<Ret, Err>
+            + Send
+            + 'static,
         Status: Send + Sync + 'static + Unpin,
         Ret: Send + Sync + 'static,
         Err: Send + Sync + 'static,
@@ -478,7 +480,7 @@ impl TaskManager {
 
     pub fn spawn<F, Fut, Status, Ret, Err>(&self, f: F) -> TaskId
     where
-        F: FnOnce(ProgressUpdater<Status>, CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(TaskManager, ProgressUpdater<Status>, CancellationToken) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<Ret, Err>> + Send + 'static,
         Status: Send + Sync + 'static + Unpin,
         Ret: Send + Sync + 'static,
@@ -507,6 +509,7 @@ impl TaskManager {
         let tasks_for_result = self.tasks.clone();
         let handles_ref = self.handles.clone();
         let changes = self.changes.clone();
+        let tm = self.clone();
         let worker_handle = tokio::spawn(async move {
             let _guard = TaskGuard {
                 task_id,
@@ -515,9 +518,10 @@ impl TaskManager {
                 changes,
                 ttl: Duration::from_secs(60),
             };
-            let res =
-                FutureExt::catch_unwind(AssertUnwindSafe(async { f(progress, task_token).await }))
-                    .await;
+            let res = FutureExt::catch_unwind(AssertUnwindSafe(async {
+                f(tm, progress, task_token).await
+            }))
+            .await;
             let terminal_state = match res {
                 Ok(Ok(val)) => TaskState::Completed(Arc::new(val)),
                 Ok(Err(err)) => TaskState::Failed(Arc::new(err)),
@@ -546,7 +550,9 @@ impl TaskManager {
 
     pub fn spawn_blocking<F, Status, Ret, Err>(&self, f: F) -> TaskId
     where
-        F: FnOnce(ProgressUpdater<Status>, CancellationToken) -> Result<Ret, Err> + Send + 'static,
+        F: FnOnce(TaskManager, ProgressUpdater<Status>, CancellationToken) -> Result<Ret, Err>
+            + Send
+            + 'static,
         Status: Send + Sync + 'static + Unpin,
         Ret: Send + Sync + 'static,
         Err: Send + Sync + 'static,
@@ -575,6 +581,7 @@ impl TaskManager {
         let tasks_for_result = self.tasks.clone();
         let handles_ref = self.handles.clone();
         let changes = self.changes.clone();
+        let tm = self.clone();
         let worker_handle = tokio::spawn(async move {
             let _guard = TaskGuard {
                 task_id,
@@ -585,7 +592,7 @@ impl TaskManager {
             };
             let blocking_res = tokio::task::spawn_blocking(move || {
                 let _death_tx = death_tx;
-                f(progress, task_token)
+                f(tm, progress, task_token)
             })
             .await;
             let terminal_state = match blocking_res {
@@ -829,8 +836,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_task_completes() {
         let tm = mk_tm();
-        let h =
-            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(42) });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(42) },
+        );
         assert!(
             wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
             "task should complete, got {:?}",
@@ -845,9 +853,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_task_fails() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            Err::<Ret, Err>("boom".to_string())
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                Err::<Ret, Err>("boom".to_string())
+            },
+        );
         assert!(
             wait_until(|| h.status().is_failed(), Duration::from_secs(2)).await,
             "task should fail, got {:?}",
@@ -862,11 +872,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_task_panics() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            panic!("async panic payload");
-            #[allow(unreachable_code)]
-            Ok::<Ret, Err>(0)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                panic!("async panic payload");
+                #[allow(unreachable_code)]
+                Ok::<Ret, Err>(0)
+            },
+        );
         assert!(
             wait_until(|| h.status().is_panicked(), Duration::from_secs(2)).await,
             "task should panic, got {:?}",
@@ -881,7 +893,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_task_completes_and_panics() {
         let tm = mk_tm();
-        let h = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, _ct| Ok::<Ret, Err>(7));
+        let h = tm.spawn_blocking_typed(|_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| {
+            Ok::<Ret, Err>(7)
+        });
         assert!(
             wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
             "blocking task should complete, got {:?}",
@@ -892,7 +906,7 @@ mod tests {
             s => panic!("unexpected state: {:?}", s),
         }
 
-        let hp = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, _ct| {
+        let hp = tm.spawn_blocking_typed(|_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| {
             panic!("blocking panic payload");
             #[allow(unreachable_code)]
             Ok::<Ret, Err>(0)
@@ -913,15 +927,17 @@ mod tests {
         let tm = mk_tm();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, _ct| async move {
-            pc.update(1); // Pending -> Running（回归测试 alter 修复）
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            pc.update(2); // 覆盖 Running 值
-            // 等主测试观察到 Running(2) 后再退出
-            let _ = release_rx.await;
-            let _ = done_tx.send(());
-            Ok::<Ret, Err>(0)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, pc: ProgressUpdater<Status>, _ct| async move {
+                pc.update(1); // Pending -> Running（回归测试 alter 修复）
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                pc.update(2); // 覆盖 Running 值
+                // 等主测试观察到 Running(2) 后再退出
+                let _ = release_rx.await;
+                let _ = done_tx.send(());
+                Ok::<Ret, Err>(0)
+            },
+        );
         // 第一次 update 后应是 Running(1)
         assert!(
             wait_until(
@@ -955,12 +971,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn progress_does_not_override_cancelling() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, ct| async move {
-            pc.update(1);
-            ct.cancelled().await; // 等 cancel_task 把状态置为 Cancelling
-            pc.update(2); // 必须被 alter 拒绝（不覆盖 Cancelling）
-            Ok::<Ret, Err>(0)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, pc: ProgressUpdater<Status>, ct| async move {
+                pc.update(1);
+                ct.cancelled().await; // 等 cancel_task 把状态置为 Cancelling
+                pc.update(2); // 必须被 alter 拒绝（不覆盖 Cancelling）
+                Ok::<Ret, Err>(0)
+            },
+        );
         assert!(
             wait_until(
                 || matches!(h.status(), TypedTaskState::Running(v) if *v == 1),
@@ -986,12 +1004,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cooperative_cancel_async() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, ct| async move {
-            while !ct.is_cancelled() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Ok::<Ret, Err>(1)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, ct| async move {
+                while !ct.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<Ret, Err>(1)
+            },
+        );
         h.cancel();
         assert!(
             wait_until(|| h.status().is_cancelled(), Duration::from_secs(3)).await,
@@ -1004,11 +1024,13 @@ mod tests {
     #[ignore = "takes ~5s due to cancel_task abort timeout"]
     async fn cancel_aborts_unresponsive_async() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            // 不响应 ct：挂起 1 小时，必须被 abort 干掉
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok::<Ret, Err>(1)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                // 不响应 ct：挂起 1 小时，必须被 abort 干掉
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok::<Ret, Err>(1)
+            },
+        );
         h.cancel();
         assert!(
             wait_until(|| h.status().is_cancelled(), Duration::from_secs(8)).await,
@@ -1020,7 +1042,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cooperative_cancel_blocking() {
         let tm = mk_tm();
-        let h = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, ct| {
+        let h = tm.spawn_blocking_typed(|_tm: TaskManager, _pc: ProgressUpdater<Status>, ct| {
             while !ct.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1038,8 +1060,9 @@ mod tests {
     async fn spawn_after_close_immediately_cancelled() {
         let tm = mk_tm();
         tm.close();
-        let h =
-            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(1) });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(1) },
+        );
         assert!(
             wait_until(|| h.status().is_cancelled(), Duration::from_secs(2)).await,
             "task spawned after close should be Cancelled, got {:?}",
@@ -1051,13 +1074,15 @@ mod tests {
     async fn cancel_at_triggers_cancel() {
         let tm = mk_tm();
         let ct = CancellationToken::new();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, task_ct| async move {
-            tokio::select! {
-                _ = task_ct.cancelled() => {}
-                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
-            }
-            Ok::<Ret, Err>(1)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, task_ct| async move {
+                tokio::select! {
+                    _ = task_ct.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                }
+                Ok::<Ret, Err>(1)
+            },
+        );
         h.cancel_at(&ct);
         // 等 watcher 注册后触发
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1072,8 +1097,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_status_removes_handle_after_terminal() {
         let tm = mk_tm();
-        let h =
-            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(3) });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(3) },
+        );
         assert!(
             wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
             "task should complete"
@@ -1089,10 +1115,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_returns_completed_value() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            Ok::<Ret, Err>(42)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok::<Ret, Err>(42)
+            },
+        );
         // spawn 后立刻等待（任务还处于 Pending），验证事件通知唤醒而非轮询
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
             .await
@@ -1106,9 +1134,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_returns_failed() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            Err::<Ret, Err>("wait fail".to_string())
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                Err::<Ret, Err>("wait fail".to_string())
+            },
+        );
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
             .await
             .expect("wait_terminal should return promptly");
@@ -1121,11 +1151,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_returns_panicked() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            panic!("wait panic payload");
-            #[allow(unreachable_code)]
-            Ok::<Ret, Err>(0)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                panic!("wait panic payload");
+                #[allow(unreachable_code)]
+                Ok::<Ret, Err>(0)
+            },
+        );
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
             .await
             .expect("wait_terminal should return promptly");
@@ -1138,8 +1170,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_immediate_when_already_terminal() {
         let tm = mk_tm();
-        let h =
-            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(9) });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(9) },
+        );
         assert!(
             wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
             "task should complete first"
@@ -1159,7 +1192,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_on_blocking_task() {
         let tm = mk_tm();
-        let h = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, _ct| Ok::<Ret, Err>(7));
+        let h = tm.spawn_blocking_typed(|_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| {
+            Ok::<Ret, Err>(7)
+        });
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
             .await
             .expect("blocking task should finish");
@@ -1169,10 +1204,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_then_wait_terminal_returns_cancelled() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, ct| async move {
-            ct.cancelled().await; // 协作式: cancel 后立即退出
-            Ok::<Ret, Err>(1)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, ct| async move {
+                ct.cancelled().await; // 协作式: cancel 后立即退出
+                Ok::<Ret, Err>(1)
+            },
+        );
         h.cancel();
         let ts = tokio::time::timeout(Duration::from_secs(3), h.wait_terminal())
             .await
@@ -1187,12 +1224,13 @@ mod tests {
         // 不能用状态判断"任务开始执行", 这里用 flag 确认闭包已进入。
         let entered = Arc::new(AtomicBool::new(false));
         let e2 = entered.clone();
-        let h = tm.spawn_blocking_typed(move |_pc: ProgressUpdater<Status>, _ct| {
-            e2.store(true, Ordering::Release);
-            // 不响应 token, 200ms 后自行返回
-            std::thread::sleep(Duration::from_millis(200));
-            Ok::<Ret, Err>(1)
-        });
+        let h =
+            tm.spawn_blocking_typed(move |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| {
+                e2.store(true, Ordering::Release);
+                // 不响应 token, 200ms 后自行返回
+                std::thread::sleep(Duration::from_millis(200));
+                Ok::<Ret, Err>(1)
+            });
         // 等闭包真正开始执行
         assert!(
             wait_until(|| entered.load(Ordering::Acquire), Duration::from_secs(2)).await,
@@ -1215,11 +1253,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_observes_cancelling_or_cancelled() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, ct| async move {
-            pc.update(1); // Running
-            ct.cancelled().await;
-            Ok::<Ret, Err>(1)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, pc: ProgressUpdater<Status>, ct| async move {
+                pc.update(1); // Running
+                ct.cancelled().await;
+                Ok::<Ret, Err>(1)
+            },
+        );
         // 等 Running 可见后, 用 wait_for 谓词等待 Cancelling/Cancelled
         assert!(
             wait_until(
@@ -1246,8 +1286,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_terminal_fallback_when_predicate_never_matches() {
         let tm = mk_tm();
-        let h =
-            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(5) });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(5) },
+        );
         // 谓词永远 false: 任务进入终态后必须兜底返回 terminal, 而不是永久挂起
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_for(|_| false))
             .await
@@ -1261,10 +1302,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_multi_waiter_all_woken() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            Ok::<Ret, Err>(11)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok::<Ret, Err>(11)
+            },
+        );
         let (a, b) = tokio::join!(h.wait_terminal(), h.wait_terminal());
         assert!(matches!(a, TypedTaskState::Completed(v) if *v == 11));
         assert!(matches!(b, TypedTaskState::Completed(v) if *v == 11));
@@ -1287,8 +1330,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_wrong_type_handle_is_invalid() {
         let tm = mk_tm();
-        let h =
-            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(3) });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, _pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(3) },
+        );
         assert!(
             wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
             "task should complete"
@@ -1355,13 +1399,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_observes_running_on_first_update() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, _ct| async move {
-            tokio::time::sleep(Duration::from_millis(20)).await; // 给 waiter 时间先挂起
-            pc.update(1); // Pending -> Running: 切换通知
-            pc.update(2); // Running -> Running: 值刷新, 不通知(等 v==2 的谓词不应依赖它)
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            Ok::<Ret, Err>(0)
-        });
+        let h = tm.spawn_typed(
+            |_tm: TaskManager, pc: ProgressUpdater<Status>, _ct| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await; // 给 waiter 时间先挂起
+                pc.update(1); // Pending -> Running: 切换通知
+                pc.update(2); // Running -> Running: 值刷新, 不通知(等 v==2 的谓词不应依赖它)
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<Ret, Err>(0)
+            },
+        );
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_for(|s| s.is_running()))
             .await
             .expect("首次 update 的 Pending->Running 切换应唤醒 waiter");

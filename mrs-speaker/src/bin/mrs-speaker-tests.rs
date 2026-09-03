@@ -70,7 +70,7 @@ async fn audio_handler_test(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ct2 = ct.clone();
     let mixers = Arc::new(aud::mixer::Mixers::new(tm.clone(), ct2.clone()));
-    let h = tm.spawn_blocking_typed(move |pu, ct| {
+    let h = tm.spawn_blocking_typed(move |tm, pu, ct| {
         pu.update(());
         aud::handler::host_handler(tm, mixers, ct);
         Ok::<(), ()>(())
@@ -78,6 +78,6 @@ async fn audio_handler_test(
     tokio::time::sleep(Duration::from_secs(5)).await;
     warn!("Triggering CancellationToken.");
     ct.cancel();
-    h.wait_terminal();
+    h.wait_terminal().await;
     Ok(())
 }

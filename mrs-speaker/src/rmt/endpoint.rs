@@ -101,8 +101,7 @@ impl MrsRpcTrait for RpcEp {
         let tid = self
             .ctx
             .task_manager
-            .clone()
-            .spawn(|stat, ct| store_audio_sample_task(sample_ticket, ep, ss, stat, ct));
+            .spawn(|_tm, stat, ct| store_audio_sample_task(sample_ticket, ep, ss, stat, ct));
         tid
     }
 
