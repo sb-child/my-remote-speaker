@@ -390,6 +390,10 @@ fn stream_handler(
                 }
             },
         };
+        // cpal stream 默认是暂停状态。
+        if let Err(e) = stream.play() {
+            return Err(StreamHandlerError::OtherDeviceError { source: e });
+        }
         info!("Stream started, waiting for events.");
         loop {
             match stream_handle_event(&mut sel, &restart_rx, &events_rx, &ct) {

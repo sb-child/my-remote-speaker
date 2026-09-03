@@ -95,6 +95,8 @@ async fn audio_test(
     let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
     let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
     th.push_clip_group(clipgroup).await?;
+
+    info!("play track.");
     let track = mh.add_tracks(vec![track]).map_err(|e| format!("{:?}", e))?;
     let track_id = track.get(0).ok_or("no track id.")?;
 

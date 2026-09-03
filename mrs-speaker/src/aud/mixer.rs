@@ -306,7 +306,6 @@ fn select_mixer_channel(
                 mixer_buf.clear();
                 mixer_buf.reserve(size.saturating_sub(mixer_buf.capacity()));
                 mixer_buf.resize(size, 0.0);
-                mixer_buf.fill(0.0);
                 mixer_mix_tracks(&mut buf, mixer_buf, tracks);
                 // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
                 frame_tx.send(buf);
