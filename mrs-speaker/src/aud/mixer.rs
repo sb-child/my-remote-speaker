@@ -11,13 +11,9 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
-use tokio_util::{
-    bytes::buf,
-    sync::{CancellationToken, DropGuard},
-};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
@@ -39,10 +35,10 @@ type MixerCmdRx = crossfire::MRx<crossfire::mpmc::Array<MixerCmd>>;
 
 enum MixerTriggerPayload {
     Seek(usize),
-    Read(usize, Option<OneshotTx<Vec<f32>>>),
+    Read(usize, Vec<f32>, OneshotTx<Vec<f32>>),
 }
 
-type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>;
+type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<MixerTriggerPayload>>;
 
 /// 混音器
 ///
@@ -67,7 +63,7 @@ impl Mixer {
         let state = Arc::new(MixerLinkState {
             read_frames_errored: Default::default(),
             disconnected: Default::default(),
-            disconnect_at: AtomicInstant::new(Instant::now()).into(),
+            disconnect_at: AtomicInstant::new(Instant::now()),
         });
         (
             Self {
@@ -210,7 +206,7 @@ impl MixerController {
 
 /// 设计上只允许一个线程读取，不要并发读。
 pub struct MixerOutput {
-    trig_tx: crossfire::MTx<crossfire::mpmc::Array<(usize, Option<OneshotTx<Vec<f32>>>)>>,
+    trig_tx: crossfire::MTx<crossfire::mpmc::Array<MixerTriggerPayload>>,
     buf: Option<Vec<f32>>,
     state: Arc<MixerLinkState>,
 }
@@ -239,7 +235,10 @@ impl MixerOutput {
             // 2 channel * 48000 Hz * seconds
             let skip_items = 2 * (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
             // 快进 buffer
-            match self.trig_tx.send_timeout((skip_items, None), time_left) {
+            match self
+                .trig_tx
+                .send_timeout(MixerTriggerPayload::Seek(skip_items), time_left)
+            {
                 Err(SendTimeoutError::Timeout(_v)) => {
                     // trig channel 积攒了一个 message，刚发的 message 被退回。
                     // 只有 read_frames 被并发调用或 mixer_worker 忙时才能触发这里。但此方法不允许并发调用。
@@ -259,12 +258,17 @@ impl MixerOutput {
         } else {
             Instant::now()
         };
+        // match &self.buf {
+        //     Some(buf) => {}
+        //     None => {}
+        // }
+        let buf = Vec::new(); // todo
         // 开销是一次box堆分配
         let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
-        match self
-            .trig_tx
-            .send_timeout((data.len(), Some(frame_tx)), time_left)
-        {
+        match self.trig_tx.send_timeout(
+            MixerTriggerPayload::Read(data.len(), buf, frame_tx),
+            time_left,
+        ) {
             Err(SendTimeoutError::Timeout(_v)) => {
                 // trig channel 积攒了一个 message，刚发的 message 被退回。
                 // 上一个 `Some(frame_tx)` 的 `frame_rx` 已被 drop，让 worker 对它发送的内容被自动 drop 所以没问题
@@ -301,9 +305,9 @@ impl MixerOutput {
 }
 
 struct MixerLinkState {
-    read_frames_errored: Arc<AtomicBool>,
-    disconnected: Arc<AtomicBool>,
-    disconnect_at: Arc<AtomicInstant>,
+    read_frames_errored: AtomicBool,
+    disconnected: AtomicBool,
+    disconnect_at: AtomicInstant,
 }
 
 /// 音频轨道

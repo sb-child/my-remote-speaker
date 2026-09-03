@@ -1,9 +1,3 @@
-use std::{
-    collections::{HashMap, HashSet},
-    thread,
-    time::Duration,
-};
-
 use cpal::{
     BufferSize, DeviceType, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedOutputConfigs,
     SupportedStreamConfig, SupportedStreamConfigRange,
@@ -14,6 +8,11 @@ use my_remote_speaker::{
     util::IteratorExt as _,
 };
 use snafu::prelude::*;
+use std::{
+    collections::{HashMap, HashSet},
+    thread,
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 

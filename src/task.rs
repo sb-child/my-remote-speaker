@@ -12,8 +12,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use_id!(Task);
