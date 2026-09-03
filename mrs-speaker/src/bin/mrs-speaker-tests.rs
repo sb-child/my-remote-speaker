@@ -67,8 +67,9 @@ async fn audio_handler_test(ct: CancellationToken) -> Result<(), Box<dyn std::er
     let tm = TaskManager::new();
     let tm2 = tm.clone();
     let ct2 = ct.clone();
-    let h = tokio::task::spawn_blocking(|| {
-        aud::handler::host_handler(tm2, (), ct2);
+    let h = tokio::task::spawn_blocking(move || {
+        let mixers = aud::mixer::Mixers::new(tm2.clone(), ct2.clone());
+        aud::handler::host_handler(tm2, mixers, ct2);
     });
     tokio::time::sleep(Duration::from_secs(5)).await;
     warn!("Triggering CancellationToken.");

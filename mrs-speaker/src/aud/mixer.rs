@@ -1,4 +1,5 @@
 use crate::aud::SAMPLE_RATE;
+use cpal::DeviceId;
 use crossfire::{BlockingTxTrait, RecvError, RecvTimeoutError, SendTimeoutError, select::Select};
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager},
@@ -14,14 +15,66 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::{error, info};
 
 type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
 
 /// 混音器管理器
 ///
-/// 可以动态创建和删除混音器。
-pub struct Mixers {}
+/// 为每个设备分配一个 Mixer。
+pub struct Mixers {
+    tm: TaskManager,
+    ct: CancellationToken,
+    mixers: HashMap<DeviceId, MixerBundle>,
+}
+
+impl Mixers {
+    pub fn new(tm: TaskManager, ct: CancellationToken) -> Self {
+        Self {
+            tm,
+            ct,
+            mixers: HashMap::new(),
+        }
+    }
+
+    /// 取设备的 mixer，不存在则创建。
+    pub fn get_or_create(
+        &mut self,
+        dev_id: &DeviceId,
+    ) -> (MixerHandle, MixerController, MixerOutput) {
+        if let Some(b) = self.mixers.get(dev_id) {
+            let panicked = b
+                .mixer
+                .worker
+                .as_ref()
+                .map_or(false, |w| w.status().is_panicked());
+            if !panicked {
+                return (b.handle.clone(), b.ctrl.clone(), b.out.clone());
+            }
+            error!(dev = ?dev_id, "mixer worker panicked. dropping and recreating.");
+            self.mixers.remove(dev_id);
+        }
+        let (mixer, handle, ctrl, out) = Mixer::create(&self.tm, &self.ct);
+        let ret = (handle.clone(), ctrl.clone(), out.clone());
+        self.mixers.insert(
+            dev_id.clone(),
+            MixerBundle {
+                mixer,
+                handle,
+                ctrl,
+                out,
+            },
+        );
+        ret
+    }
+
+    pub fn remove(&mut self, dev_id: &DeviceId) {
+        if self.mixers.remove(dev_id).is_some() {
+            info!(dev = ?dev_id, "mixer removed");
+        }
+    }
+}
 
 use_id!(Track);
 
@@ -40,20 +93,25 @@ enum MixerTriggerPayload {
 
 type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<MixerTriggerPayload>>;
 
+struct MixerBundle {
+    mixer: Mixer,
+    handle: MixerHandle,
+    ctrl: MixerController,
+    out: MixerOutput,
+}
+
 /// 混音器
 ///
 /// 可以挂载多个轨道，合并为一个输出。
 pub struct Mixer {
-    cmd_rx: MixerCmdRx,
-    trig_rx: MixerTrigRx,
     worker: Option<TaskHandle<(), (), ()>>,
-    ct_guard: DropGuard,
+    _ct_guard: DropGuard,
 }
 
 impl Mixer {
-    pub fn new(
+    fn create(
         tm: &TaskManager,
-        ct: CancellationToken,
+        ct: &CancellationToken,
     ) -> (Self, MixerHandle, MixerController, MixerOutput) {
         let mixer_ct = ct.child_token();
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
@@ -67,10 +125,8 @@ impl Mixer {
         });
         (
             Self {
-                cmd_rx,
-                trig_rx,
                 worker: Some(worker),
-                ct_guard,
+                _ct_guard: ct_guard,
             },
             MixerHandle { cmd_tx },
             MixerController {
@@ -225,6 +281,7 @@ fn mixer_on_remove_tracks(
         .collect()
 }
 
+#[derive(Clone)]
 pub struct MixerHandle {
     cmd_tx: MixerCmdTx,
 }

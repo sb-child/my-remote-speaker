@@ -19,7 +19,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::aud::{
     SAMPLE_RATE,
     dcblocker::DcBlocker,
-    mixer::{Mixer, MixerController, MixerOutput},
+    mixer::{MixerController, MixerOutput, Mixers},
 };
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
@@ -29,15 +29,14 @@ fn on_device_add(
     dev_id_str: String,
     dev_id: cpal::DeviceId,
     dh: &mut DeviceHandles,
+    mixers: &mut Mixers,
     tm: &TaskManager,
 ) {
     let dev_id_2 = dev_id.clone();
-    let tm2 = tm.clone();
-    let (mixer, mixer_handle, mixer_ctrl, mixer_out) = Mixer::new(tm, CancellationToken::new()); // todo，之后会移走
+    let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_id);
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()); // todo
-
-        device_handler(&dev_id_str, &dev_id_2, (), ct, mixer_ctrl, mixer_out)
+        device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task started. Cancelling old task.");
@@ -52,6 +51,7 @@ fn on_device_del(
     dev_id_str: String,
     dev_id: cpal::DeviceId,
     dh: &mut DeviceHandles,
+    mixers: &mut Mixers,
     _tm: &TaskManager,
 ) {
     if let Some(task) = dh.remove(&dev_id) {
@@ -60,6 +60,8 @@ fn on_device_del(
     } else {
         warn!("Task not found.");
     };
+    // 设备没了，mixer 也杀：bundle drop → worker 取消 + 通道断开
+    mixers.remove(&dev_id);
 }
 
 /// - true: set blacklisted
@@ -70,6 +72,7 @@ fn on_device_online(
     dev_id: cpal::DeviceId,
     blacklisted: bool,
     dh: &mut DeviceHandles,
+    mixers: &mut Mixers,
     tm: &TaskManager,
 ) -> bool {
     if let Some(task) = dh.get(&dev_id) {
@@ -81,11 +84,10 @@ fn on_device_online(
         }
     }
     let dev_id_2 = dev_id.clone();
-    let tm2 = tm.clone();
-    let (mixer, mixer_handle, mixer_ctrl, mixer_out) = Mixer::new(tm, CancellationToken::new()); // todo，之后会移走
+    let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_id);
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()); // todo
-        device_handler(&dev_id_str, &dev_id_2, (), ct, mixer_ctrl, mixer_out)
+        device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
     });
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task restarted. Cancelling old task.");
@@ -157,7 +159,7 @@ fn get_device_status(
     }
 }
 
-pub fn host_handler(tm: TaskManager, mixers: (), ct: CancellationToken) {
+pub fn host_handler(tm: TaskManager, mut mixers: Mixers, ct: CancellationToken) {
     let audio_host = cpal::default_host();
     enum Action {
         OnDeviceAdd,
@@ -200,14 +202,19 @@ pub fn host_handler(tm: TaskManager, mixers: (), ct: CancellationToken) {
         for (dev_id, action) in actions {
             let dev_id_str = dev_id.to_string();
             match action {
-                Action::OnDeviceAdd => on_device_add(dev_id_str, dev_id, &mut device_handles, &tm),
-                Action::OnDeviceDel => on_device_del(dev_id_str, dev_id, &mut device_handles, &tm),
+                Action::OnDeviceAdd => {
+                    on_device_add(dev_id_str, dev_id, &mut device_handles, &mut mixers, &tm)
+                }
+                Action::OnDeviceDel => {
+                    on_device_del(dev_id_str, dev_id, &mut device_handles, &mut mixers, &tm)
+                }
                 Action::OnDeviceOnline(blacklisted) => {
                     let should_blacklist_this = on_device_online(
                         dev_id_str,
                         dev_id.clone(),
                         blacklisted,
                         &mut device_handles,
+                        &mut mixers,
                         &tm,
                     );
                     if should_blacklist_this {
@@ -232,7 +239,6 @@ pub fn host_handler(tm: TaskManager, mixers: (), ct: CancellationToken) {
 fn device_handler(
     _dev_id: &str,
     dev_id: &cpal::DeviceId,
-    mixer: (),
     ct: CancellationToken,
     mixer_ctrl: MixerController,
     mixer_out: MixerOutput,
