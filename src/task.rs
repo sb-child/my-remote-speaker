@@ -69,25 +69,25 @@ impl TaskState {
         )
     }
 
-    pub fn downcast_running<P: 'static + Sync + Send>(&self) -> Option<Arc<P>> {
+    pub fn downcast_running<Progress: 'static + Sync + Send>(&self) -> Option<Arc<Progress>> {
         if let TaskState::Running(val) = self {
-            val.clone().downcast::<P>().ok()
+            val.clone().downcast::<Progress>().ok()
         } else {
             None
         }
     }
 
-    pub fn downcast_completed<T: 'static + Sync + Send>(&self) -> Option<Arc<T>> {
+    pub fn downcast_completed<Ret: 'static + Sync + Send>(&self) -> Option<Arc<Ret>> {
         if let TaskState::Completed(val) = self {
-            val.clone().downcast::<T>().ok()
+            val.clone().downcast::<Ret>().ok()
         } else {
             None
         }
     }
 
-    pub fn downcast_failed<E: 'static + Sync + Send>(&self) -> Option<Arc<E>> {
+    pub fn downcast_failed<Err: 'static + Sync + Send>(&self) -> Option<Arc<Err>> {
         if let TaskState::Failed(val) = self {
-            val.clone().downcast::<E>().ok()
+            val.clone().downcast::<Err>().ok()
         } else {
             None
         }
@@ -101,16 +101,16 @@ impl TaskState {
         }
     }
 
-    pub fn into_result<T, E>(&self) -> Option<Result<Arc<T>, TaskError<E>>>
+    pub fn into_result<Ret, Err>(&self) -> Option<Result<Arc<Ret>, TaskError<Err>>>
     where
-        T: 'static + Send + Sync,
-        E: 'static + Send + Sync,
+        Ret: 'static + Send + Sync,
+        Err: 'static + Send + Sync,
     {
         match self {
-            TaskState::Completed(val) => val.clone().downcast::<T>().ok().map(Ok),
+            TaskState::Completed(val) => val.clone().downcast::<Ret>().ok().map(Ok),
             TaskState::Failed(err) => err
                 .clone()
-                .downcast::<E>()
+                .downcast::<Err>()
                 .ok()
                 .map(|e| Err(TaskError::Failed(e))),
             TaskState::Cancelled => Some(Err(TaskError::Cancelled)),
@@ -119,29 +119,59 @@ impl TaskState {
         }
     }
 
-    pub fn to_typed<P, T, E>(&self) -> Option<TypedTaskState<P, T, E>>
+    pub fn to_typed<Status, Ret, Err>(&self) -> TypedTaskState<Status, Ret, Err>
     where
-        P: 'static + Send + Sync,
-        T: 'static + Send + Sync,
-        E: 'static + Send + Sync,
+        Status: 'static + Send + Sync,
+        Ret: 'static + Send + Sync,
+        Err: 'static + Send + Sync,
     {
-        Some(match self {
+        match self {
             TaskState::Pending => TypedTaskState::Pending,
             TaskState::Cancelling => TypedTaskState::Cancelling,
             TaskState::Cancelled => TypedTaskState::Cancelled,
             TaskState::Panicked(msg) => TypedTaskState::Panicked(msg.clone()),
             TaskState::Running(v) => v
                 .clone()
-                .downcast::<P>()
+                .downcast::<Status>()
                 .map(TypedTaskState::Running)
-                .ok()?,
+                .unwrap_or(TypedTaskState::Invalid),
             TaskState::Completed(v) => v
                 .clone()
-                .downcast::<T>()
+                .downcast::<Ret>()
                 .map(TypedTaskState::Completed)
-                .ok()?,
-            TaskState::Failed(v) => v.clone().downcast::<E>().map(TypedTaskState::Failed).ok()?,
-        })
+                .unwrap_or(TypedTaskState::Invalid),
+            TaskState::Failed(v) => v
+                .clone()
+                .downcast::<Err>()
+                .map(TypedTaskState::Failed)
+                .unwrap_or(TypedTaskState::Invalid),
+        }
+    }
+
+    pub fn as_typed<'a, Status, Ret, Err>(&'a self) -> TypedTaskStateRef<'a, Status, Ret, Err>
+    where
+        Status: 'static + Send + Sync,
+        Ret: 'static + Send + Sync,
+        Err: 'static + Send + Sync,
+    {
+        match self {
+            TaskState::Pending => TypedTaskStateRef::Pending,
+            TaskState::Cancelling => TypedTaskStateRef::Cancelling,
+            TaskState::Cancelled => TypedTaskStateRef::Cancelled,
+            TaskState::Panicked(msg) => TypedTaskStateRef::Panicked(msg),
+            TaskState::Running(v) => v
+                .downcast_ref::<Status>()
+                .map(TypedTaskStateRef::Running)
+                .unwrap_or(TypedTaskStateRef::Invalid),
+            TaskState::Completed(v) => v
+                .downcast_ref::<Ret>()
+                .map(TypedTaskStateRef::Completed)
+                .unwrap_or(TypedTaskStateRef::Invalid),
+            TaskState::Failed(v) => v
+                .downcast_ref::<Err>()
+                .map(TypedTaskStateRef::Failed)
+                .unwrap_or(TypedTaskStateRef::Invalid),
+        }
     }
 }
 
@@ -166,15 +196,82 @@ impl fmt::Debug for TaskState {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum TypedTaskState<P, T, E> {
+pub enum TypedTaskStateRef<'a, Status, Ret, Err> {
+    /// 任务刚刚启动，还没有汇报状态。
     Pending,
-    Running(Arc<P>),
+    /// 任务正在运行，并汇报了当前状态。
+    Running(&'a Status),
+    /// 任务正在取消。
     Cancelling,
-    Completed(Arc<T>),
-    Failed(Arc<E>),
+    /// 任务已经完成。
+    Completed(&'a Ret),
+    /// 任务已经失败。
+    Failed(&'a Err),
+    /// 任务已经取消。
     Cancelled,
+    /// 任务已经崩溃。
+    Panicked(&'a String),
+    /// 类型cast失败，或任务不存在。
+    Invalid,
+}
+
+impl<'a, Status, Ret, Err> TypedTaskStateRef<'a, Status, Ret, Err> {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+    pub fn is_cancelling(&self) -> bool {
+        matches!(self, Self::Cancelling)
+    }
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed(_))
+    }
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+    pub fn is_panicked(&self) -> bool {
+        matches!(self, Self::Panicked(_))
+    }
+    pub fn is_invalid(&self) -> bool {
+        matches!(self, Self::Invalid)
+    }
+
+    /// 任务是否已进入终态。
+    /// - 注意类型 cast 失败会导致任务为 Invalid 状态，仍然会被当做进入终态。
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed(_)
+                | Self::Failed(_)
+                | Self::Cancelled
+                | Self::Panicked(_)
+                | Self::Invalid
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum TypedTaskState<Status, Ret, Err> {
+    /// 任务刚刚启动，还没有汇报状态。
+    Pending,
+    /// 任务正在运行，并汇报了当前状态。
+    Running(Arc<Status>),
+    /// 任务正在取消。
+    Cancelling,
+    /// 任务已经完成。
+    Completed(Arc<Ret>),
+    /// 任务已经失败。
+    Failed(Arc<Err>),
+    /// 任务已经取消。
+    Cancelled,
+    /// 任务已经崩溃。
     Panicked(Arc<String>),
+    /// 类型cast失败，或任务不存在。
     Invalid,
 }
 
@@ -204,6 +301,8 @@ impl<P, T, E> TypedTaskState<P, T, E> {
         matches!(self, Self::Invalid)
     }
 
+    /// 任务是否已进入终态。
+    /// - 注意类型 cast 失败会导致任务为 Invalid 状态，仍然会被当做进入终态。
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -216,20 +315,20 @@ impl<P, T, E> TypedTaskState<P, T, E> {
     }
 }
 
-pub struct ProgressUpdater<P>
+pub struct ProgressUpdater<Status>
 where
-    P: Send + Sync + 'static + Unpin,
+    Status: Send + Sync + 'static + Unpin,
 {
     tasks: Arc<DashMap<TaskId, TaskState>>,
     task_id: TaskId,
-    _phantom: PhantomData<P>,
+    _phantom: PhantomData<Status>,
 }
 
-impl<P> ProgressUpdater<P>
+impl<Status> ProgressUpdater<Status>
 where
-    P: Send + Sync + 'static + Unpin,
+    Status: Send + Sync + 'static + Unpin,
 {
-    pub fn update(&self, state: P) {
+    pub fn update(&self, state: Status) {
         self.tasks.alter(&self.task_id, |_k, v| {
             if v.is_running() || v.is_pending() {
                 return TaskState::Running(Arc::new(state));
@@ -283,7 +382,7 @@ impl Drop for TaskGuard {
                 });
             }
         }
-        // 状态变更通知: 任务实体已退出(正常/panic/abort/drop), 唤醒 wait_for/wait_terminal
+        // 在任务实体已退出时，唤醒 wait_for/wait_terminal。
         let _ = self.changes.send_modify(|e| *e += 1);
     }
 }
@@ -479,8 +578,6 @@ impl TaskManager {
 
     /// 获取任务当前状态。
     pub fn get_status(&self, task_id: TaskId) -> Option<TaskState> {
-        // 只读查询。handles 由 worker 的 TaskGuard drop / cancel 路径负责清理,
-        // 这里不再 remove, 避免查询路径上的写锁(终态查询不再有 ~35ns 额外开销)。
         self.tasks.get(&task_id).map(|s| s.value().clone())
     }
 
@@ -555,18 +652,14 @@ impl TaskManager {
         let _ = self.changes.send_modify(|e| *e += 1);
     }
 
-    /// 异步等待任务状态满足谓词(事件驱动, 非轮询)。
-    /// - 任务生命周期转换(完成/失败/panic/取消/任务实体退出)都会唤醒等待者,
-    ///   唤醒后重新检查状态, 谓词不满足则继续等。
-    /// - 任务内部的 progress.update 不会触发通知; 若要等待 Running 等中间态,
-    ///   谓词可能长时间不满足, 建议用 tokio::time::timeout 包裹调用。
-    /// - 任务已进入终态时立即返回; 任务已被 TTL 清理(60s)时返回 None。
+    /// 等待任务状态满足谓词。
+    /// - 任务已进入终态时立即返回。
+    /// - 任务已被清理时返回 None。
     pub async fn wait_for(
         &self,
         task_id: TaskId,
         mut pred: impl FnMut(&TaskState) -> bool,
     ) -> Option<TaskState> {
-        // 先 subscribe 再查状态: 避免 [查状态 -> subscribe] 窗口内变更被漏掉
         let mut rx = self.changes.subscribe();
         loop {
             if let Some(s) = self.get_status(task_id) {
@@ -582,8 +675,7 @@ impl TaskManager {
         }
     }
 
-    /// 异步等待任务进入终态(Completed/Failed/Cancelled/Panicked)。
-    /// 事件驱动, 任务退出后立即返回, 无需轮询。
+    /// 等待任务进入终态。
     pub async fn wait_terminal(&self, task_id: TaskId) -> Option<TaskState> {
         self.wait_for(task_id, TaskState::is_terminal).await
     }
@@ -626,7 +718,6 @@ where
         self.tm
             .get_status(self.id)
             .map(|s| s.to_typed())
-            .flatten()
             .unwrap_or(TypedTaskState::Invalid)
     }
 
@@ -638,6 +729,32 @@ where
     /// 注册触发器，在 ct 触发时取消任务。
     pub fn cancel_at(&self, ct: &CancellationToken) {
         self.tm.cancel_task_at(self.id, ct);
+    }
+
+    /// 等待任务状态满足谓词。
+    /// - 任务已进入终态时立即返回。
+    /// - 任务类型 cast 失败，或被清理时立即返回。
+    pub async fn wait_for(
+        &self,
+        mut pred: impl FnMut(TypedTaskStateRef<Status, Ret, Err>) -> bool,
+    ) -> TypedTaskState<Status, Ret, Err> {
+        self.tm
+            .wait_for(self.id, |s| match s.as_typed::<Status, Ret, Err>() {
+                TypedTaskStateRef::Invalid => true, // 类型 cast 失败
+                ts => pred(ts),
+            })
+            .await
+            .map(|s| s.to_typed())
+            .unwrap_or(TypedTaskState::Invalid)
+    }
+
+    /// 等待任务进入终态。
+    pub async fn wait_terminal(&self) -> TypedTaskState<Status, Ret, Err> {
+        self.tm
+            .wait_terminal(self.id)
+            .await
+            .map(|s| s.to_typed())
+            .unwrap_or(TypedTaskState::Invalid)
     }
 }
 
