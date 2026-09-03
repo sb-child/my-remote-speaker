@@ -111,7 +111,7 @@ impl MrsRpcTrait for RpcEp {
         _context: ::tarpc::context::Context,
         tid: TaskId,
     ) -> Result<StoreSampleTaskState, TaskManageError> {
-        if let Some(Some(state)) =
+        if let Some(state) =
             self.ctx.task_manager.get_status(tid).map(|x| {
                 x.to_typed::<StoreSampleProgress, StoreSampleTaskState, StoreSampleError>()
             })

@@ -6,7 +6,7 @@ use my_remote_speaker::{
     util::AtomicInstant,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -69,24 +69,6 @@ impl Mixer {
             },
         )
     }
-
-    pub fn restart(&mut self, tm: &TaskManager) {
-        if let Some(w) = self.worker.take() {
-            w.cancel(); // worker 不会立刻关闭
-            loop {
-                thread::sleep(Duration::from_millis(100));
-                if w.status().is_terminal() {
-                    break;
-                }
-            }
-        }
-        self.worker = Some(spawn_mixer_worker(
-            tm,
-            self.trig_rx.clone(),
-            self.cmd_rx.clone(),
-            self.ct_guard.token(),
-        ));
-    }
 }
 
 fn spawn_mixer_worker(
@@ -105,13 +87,14 @@ fn spawn_mixer_worker(
 }
 
 fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken) {
+    let mut tracks: HashMap<TrackId, Track> = HashMap::new();
     let mut sel = Select::new();
     sel.add(&trig_rx);
     sel.add(&cmd_rx);
     loop {
         match sel.select_timeout(Duration::from_millis(50)) {
             Ok(res) => {
-                select_mixer_channel(&trig_rx, &cmd_rx, &mut sel, res);
+                select_mixer_channel(&trig_rx, &cmd_rx, &mut sel, res, &mut tracks);
                 if ct.is_cancelled() {
                     return;
                 }
@@ -131,41 +114,54 @@ fn select_mixer_channel(
     cmd_rx: &MixerCmdRx,
     sel: &mut crossfire::select::Select<'_>,
     res: crossfire::select::SelectResult,
+    tracks: &mut HashMap<TrackId, Track>,
 ) {
     if res == *trig_rx {
         match trig_rx.read_select(res) {
             Ok((size, r)) => {
                 if let Some(frame_tx) = r {
-                    let buf = mixer_mix_tracks(size);
+                    let buf = mixer_mix_tracks(size, tracks);
                     // 如果 frame_rx 被 drop，这里发送的 buf 会自动 drop。
                     frame_tx.send(buf);
                 } else {
-                    mixer_seek_tracks(size);
+                    mixer_seek_tracks(size, tracks);
                 }
             }
             Err(RecvError) => sel.remove(trig_rx),
         }
     } else if res == *cmd_rx {
         match cmd_rx.read_select(res) {
-            Ok(cmd) => mixer_handle_cmd(cmd),
+            Ok(cmd) => mixer_handle_cmd(cmd, tracks),
             Err(RecvError) => sel.remove(cmd_rx),
         }
     }
 }
 
-fn mixer_mix_tracks(items: usize) -> Vec<f32> {
+fn mixer_mix_tracks(items: usize, tracks: &mut HashMap<TrackId, Track>) -> Vec<f32> {
     let buf = Vec::new();
     // todo: mix tracks
     buf
 }
 
-fn mixer_seek_tracks(items: usize) {
+fn mixer_seek_tracks(items: usize, tracks: &mut HashMap<TrackId, Track>) {
     // todo
 }
 
-fn mixer_handle_cmd(cmd: MixerCmd) {
+fn mixer_handle_cmd(cmd: MixerCmd, state: &mut HashMap<TrackId, Track>) {
+    match cmd {
+        MixerCmd::AddTracks(tracks, tx_oneshot) => {
+            mixer_on_add_tracks(tracks, state);
+        }
+        MixerCmd::RemoveTrack(track_ids, tx_oneshot) => {
+            mixer_on_remove_tracks(track_ids, state);
+        }
+    };
     // todo
 }
+
+fn mixer_on_add_tracks(tracks_to_add: Vec<Track>, state: &mut HashMap<TrackId, Track>) {}
+
+fn mixer_on_remove_tracks(tracks_to_remove: Vec<TrackId>, state: &mut HashMap<TrackId, Track>) {}
 
 pub struct MixerHandle {
     cmd_tx: MixerCmdTx,
