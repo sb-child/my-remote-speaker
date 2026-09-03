@@ -354,6 +354,7 @@ where
     Status: Send + Sync + 'static + Unpin,
 {
     tasks: Arc<DashMap<TaskId, TaskState>>,
+    changes: watch::Sender<u64>,
     task_id: TaskId,
     _phantom: PhantomData<Status>,
 }
@@ -363,12 +364,18 @@ where
     Status: Send + Sync + 'static + Unpin,
 {
     pub fn update(&self, state: Status) {
+        let mut transitioned = false;
         self.tasks.alter(&self.task_id, |_k, v| {
-            if v.is_running() || v.is_pending() {
-                return TaskState::Running(Arc::new(state));
+            match &v {
+                TaskState::Pending => transitioned = true,
+                TaskState::Running(_) => {}
+                _ => return v,
             }
-            v
+            TaskState::Running(Arc::new(state))
         });
+        if transitioned {
+            let _ = self.changes.send_modify(|e| *e += 1);
+        }
     }
 }
 
@@ -493,6 +500,7 @@ impl TaskManager {
         let task_token = token.clone();
         let progress = ProgressUpdater {
             tasks: self.tasks.clone(),
+            changes: self.changes.clone(),
             task_id,
             _phantom: PhantomData,
         };
@@ -559,6 +567,7 @@ impl TaskManager {
         let task_token = token.clone();
         let progress = ProgressUpdater {
             tasks: self.tasks.clone(),
+            changes: self.changes.clone(),
             task_id,
             _phantom: PhantomData,
         };
@@ -687,6 +696,7 @@ impl TaskManager {
     }
 
     /// 等待任务状态满足谓词。
+    /// - 只在状态切换时检查，在 Running 更新时不会检查。
     /// - 任务已进入终态时立即返回。
     /// - 任务已被清理时返回 None。
     pub async fn wait_for(
@@ -766,6 +776,7 @@ where
     }
 
     /// 等待任务状态满足谓词。
+    /// - 只在状态切换时检查，在 Running 更新时不会检查。
     /// - 任务已进入终态时立即返回。
     /// - 任务类型 cast 失败，或被清理时立即返回。
     pub async fn wait_for(
@@ -1139,7 +1150,10 @@ mod tests {
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
             .await
             .expect("should return immediately");
-        assert!(t0.elapsed() < Duration::from_millis(100), "should not wait for a notification");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "should not wait for a notification"
+        );
         assert!(matches!(ts, TypedTaskState::Completed(v) if *v == 9));
     }
 
@@ -1233,14 +1247,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_for_terminal_fallback_when_predicate_never_matches() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            Ok::<Ret, Err>(5)
-        });
+        let h =
+            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(5) });
         // 谓词永远 false: 任务进入终态后必须兜底返回 terminal, 而不是永久挂起
         let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_for(|_| false))
             .await
             .expect("terminal fallback should return");
-        assert!(ts.is_completed(), "expected Completed via terminal fallback, got {ts:?}");
+        assert!(
+            ts.is_completed(),
+            "expected Completed via terminal fallback, got {ts:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1260,12 +1276,9 @@ mod tests {
         let tm = mk_tm();
         let ghost = TaskId::from(999_999);
         // TaskManager 层: 任务不存在 -> None
-        let none = tokio::time::timeout(
-            Duration::from_secs(1),
-            tm.wait_terminal(ghost),
-        )
-        .await
-        .expect("must return immediately");
+        let none = tokio::time::timeout(Duration::from_secs(1), tm.wait_terminal(ghost))
+            .await
+            .expect("must return immediately");
         assert!(none.is_none(), "expected None for nonexistent task");
         // Handle 层: 任务不存在 -> Invalid
         let h = TaskHandle::<Status, Ret, Err>::new(ghost, tm);
@@ -1275,9 +1288,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_terminal_wrong_type_handle_is_invalid() {
         let tm = mk_tm();
-        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
-            Ok::<Ret, Err>(3)
-        });
+        let h =
+            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(3) });
         assert!(
             wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
             "task should complete"
@@ -1302,9 +1314,11 @@ mod tests {
         let back: TypedTaskState<u32, i32, String> = r.into();
         assert!(matches!(back, TypedTaskState::Completed(v) if *v == 42));
         // 无 payload 变体往返
-        let p: TypedTaskStateRef<u32, i32, String> = (&TypedTaskState::<u32, i32, String>::Pending).into();
+        let p: TypedTaskStateRef<u32, i32, String> =
+            (&TypedTaskState::<u32, i32, String>::Pending).into();
         assert!(p.is_pending());
-        let o: TypedTaskState<u32, i32, String> = TypedTaskStateRef::Panicked(&"x".to_string()).into();
+        let o: TypedTaskState<u32, i32, String> =
+            TypedTaskStateRef::Panicked(&"x".to_string()).into();
         assert!(o.is_panicked());
         let inv_r: TypedTaskStateRef<u32, i32, String> =
             (&TypedTaskState::<u32, i32, String>::Invalid).into();
@@ -1317,18 +1331,45 @@ mod tests {
     fn typed_cast_ok_and_mismatch() {
         // as_typed: 类型匹配 -> Running(&v)
         let s = TaskState::Running(Arc::new(7u32));
-        assert!(matches!(s.as_typed::<u32, i32, String>(), TypedTaskStateRef::Running(v) if *v == 7));
+        assert!(
+            matches!(s.as_typed::<u32, i32, String>(), TypedTaskStateRef::Running(v) if *v == 7)
+        );
         // as_typed: 类型不匹配 -> Invalid
         assert!(s.as_typed::<String, i32, String>().is_invalid());
         // to_typed: Completed downcast 失败 -> Invalid
         let c = TaskState::Completed(Arc::new(3i32));
-        assert!(matches!(c.to_typed::<u32, String, String>(), TypedTaskState::Invalid));
+        assert!(matches!(
+            c.to_typed::<u32, String, String>(),
+            TypedTaskState::Invalid
+        ));
         // into_result: downcast 失败 / 非终态 -> None
         assert!(c.into_result::<String, String>().is_none());
         assert!(TaskState::Pending.into_result::<i32, String>().is_none());
         // 终态类型匹配 -> Some(Ok/Err)
         assert!(matches!(c.into_result::<i32, String>(), Some(Ok(v)) if *v == 3));
         let f = TaskState::Failed(Arc::new("e".to_string()));
-        assert!(matches!(f.into_result::<i32, String>(), Some(Err(TaskError::Failed(e))) if e.as_str() == "e"));
+        assert!(
+            matches!(f.into_result::<i32, String>(), Some(Err(TaskError::Failed(e))) if e.as_str() == "e")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_observes_running_on_first_update() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, _ct| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await; // 给 waiter 时间先挂起
+            pc.update(1); // Pending -> Running: 切换通知
+            pc.update(2); // Running -> Running: 值刷新, 不通知(等 v==2 的谓词不应依赖它)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<Ret, Err>(0)
+        });
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_for(|s| s.is_running()))
+            .await
+            .expect("首次 update 的 Pending->Running 切换应唤醒 waiter");
+        match ts {
+            // 谓词命中 Running; 值可能已被后续 update 刷新为 2, 但变体必为 Running
+            TypedTaskState::Running(v) => assert!(*v == 1 || *v == 2, "unexpected progress {v}"),
+            s => panic!("expected Running, got {s:?}"),
+        }
     }
 }
