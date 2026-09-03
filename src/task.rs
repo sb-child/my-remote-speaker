@@ -275,6 +275,40 @@ pub enum TypedTaskState<Status, Ret, Err> {
     Invalid,
 }
 
+impl<'a, Status, Ret, Err> From<&'a TypedTaskState<Status, Ret, Err>>
+    for TypedTaskStateRef<'a, Status, Ret, Err>
+{
+    fn from(state: &'a TypedTaskState<Status, Ret, Err>) -> Self {
+        match state {
+            TypedTaskState::Pending => Self::Pending,
+            TypedTaskState::Cancelling => Self::Cancelling,
+            TypedTaskState::Cancelled => Self::Cancelled,
+            TypedTaskState::Panicked(msg) => Self::Panicked(msg),
+            TypedTaskState::Running(v) => Self::Running(v.as_ref()),
+            TypedTaskState::Completed(v) => Self::Completed(v.as_ref()),
+            TypedTaskState::Failed(v) => Self::Failed(v.as_ref()),
+            TypedTaskState::Invalid => Self::Invalid,
+        }
+    }
+}
+
+impl<'a, Status: Clone, Ret: Clone, Err: Clone> From<TypedTaskStateRef<'a, Status, Ret, Err>>
+    for TypedTaskState<Status, Ret, Err>
+{
+    fn from(state_ref: TypedTaskStateRef<'a, Status, Ret, Err>) -> Self {
+        match state_ref {
+            TypedTaskStateRef::Pending => Self::Pending,
+            TypedTaskStateRef::Cancelling => Self::Cancelling,
+            TypedTaskStateRef::Cancelled => Self::Cancelled,
+            TypedTaskStateRef::Panicked(msg) => Self::Panicked(Arc::new(msg.clone())),
+            TypedTaskStateRef::Running(v) => Self::Running(Arc::new(v.clone())),
+            TypedTaskStateRef::Completed(v) => Self::Completed(Arc::new(v.clone())),
+            TypedTaskStateRef::Failed(v) => Self::Failed(Arc::new(v.clone())),
+            TypedTaskStateRef::Invalid => Self::Invalid,
+        }
+    }
+}
+
 impl<P, T, E> TypedTaskState<P, T, E> {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
