@@ -1,6 +1,6 @@
 use crate::aud::SAMPLE_RATE;
-use cpal::DeviceId;
 use crossfire::{BlockingTxTrait, RecvError, RecvTimeoutError, SendTimeoutError, select::Select};
+use dashmap::DashMap;
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager},
     use_id,
@@ -9,7 +9,7 @@ use my_remote_speaker::{
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -17,16 +17,34 @@ use std::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{error, info};
 
-type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
-type OneshotRx<T> = crossfire::oneshot::RxOneshot<T>;
-
 /// 混音器管理器
 ///
 /// 为每个设备分配一个 Mixer。
 pub struct Mixers {
     tm: TaskManager,
     ct: CancellationToken,
-    mixers: HashMap<DeviceId, MixerBundle>,
+    inner: Arc<DashMap<String, MixerBundle>>,
+}
+
+/// 设备的可读信息
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    /// 设备 id
+    pub id: String,
+    /// 设备名
+    pub name: String,
+    /// 物理地址/连接标识
+    pub address: Option<String>,
+}
+
+impl DeviceInfo {
+    pub fn create(dev_id_str: &str, desc: Option<&cpal::DeviceDescription>) -> Self {
+        Self {
+            id: dev_id_str.to_owned(),
+            name: desc.map(|d| d.name().to_owned()).unwrap_or_default(),
+            address: desc.and_then(|d| d.address().map(str::to_owned)),
+        }
+    }
 }
 
 impl Mixers {
@@ -34,50 +52,65 @@ impl Mixers {
         Self {
             tm,
             ct,
-            mixers: HashMap::new(),
+            inner: Arc::new(DashMap::new()),
         }
     }
 
-    /// 取设备的 mixer，不存在则创建。
-    pub fn get_or_create(
-        &mut self,
-        dev_id: &DeviceId,
-    ) -> (MixerHandle, MixerController, MixerOutput) {
-        if let Some(b) = self.mixers.get(dev_id) {
-            let panicked = b
-                .mixer
-                .worker
-                .as_ref()
-                .map_or(false, |w| w.status().is_panicked());
-            if !panicked {
-                return (b.handle.clone(), b.ctrl.clone(), b.out.clone());
-            }
-            error!(dev = ?dev_id, "mixer worker panicked. dropping and recreating.");
-            self.mixers.remove(dev_id);
+    /// 取设备的 mixer，不存在则创建
+    pub fn get_or_create(&self, info: &DeviceInfo) -> (MixerHandle, MixerController, MixerOutput) {
+        if self
+            .inner
+            .remove_if(&info.id, |_, v| worker_panicked(v))
+            .is_some()
+        {
+            error!(dev = %info.id, "mixer worker panicked. dropping and recreating.");
+        }
+        if let Some(b) = self.inner.get(&info.id) {
+            return (b.handle.clone(), b.ctrl.clone(), b.out.clone());
         }
         let (mixer, handle, ctrl, out) = Mixer::create(&self.tm, &self.ct);
         let ret = (handle.clone(), ctrl.clone(), out.clone());
-        self.mixers.insert(
-            dev_id.clone(),
+        self.inner.insert(
+            info.id.clone(),
             MixerBundle {
                 mixer,
                 handle,
                 ctrl,
                 out,
+                meta: info.clone(),
             },
         );
         ret
     }
 
-    pub fn remove(&mut self, dev_id: &DeviceId) {
-        if self.mixers.remove(dev_id).is_some() {
-            info!(dev = ?dev_id, "mixer removed");
+    /// 移除指定设备的 Mixer
+    pub fn remove(&self, dev_id: &str) {
+        if self.inner.remove(dev_id).is_some() {
+            info!(dev = %dev_id, "mixer removed");
         }
     }
+
+    /// 获取指定设备的 MixerHandle
+    pub fn handle(&self, dev_id: &str) -> Option<MixerHandle> {
+        self.inner.get(dev_id).map(|b| b.handle.clone())
+    }
+
+    /// 枚举当前的设备
+    pub fn devices(&self) -> Vec<DeviceInfo> {
+        self.inner.iter().map(|b| b.meta.clone()).collect()
+    }
+}
+
+fn worker_panicked(b: &MixerBundle) -> bool {
+    b.mixer
+        .worker
+        .as_ref()
+        .map_or(false, |w| w.status().is_panicked())
 }
 
 use_id!(Track);
 
+type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 pub enum MixerCmd {
     AddTracks(Vec<Track>, OneshotTx<Vec<TrackId>>),
     RemoveTrack(Vec<TrackId>, OneshotTx<Vec<bool>>),
@@ -98,6 +131,7 @@ struct MixerBundle {
     handle: MixerHandle,
     ctrl: MixerController,
     out: MixerOutput,
+    meta: DeviceInfo,
 }
 
 /// 混音器

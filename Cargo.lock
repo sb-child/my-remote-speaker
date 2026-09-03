@@ -2751,6 +2751,7 @@ dependencies = [
  "cpal",
  "crossfire",
  "ctrlc",
+ "dashmap",
  "futures",
  "iroh",
  "iroh-blobs",

@@ -10,6 +10,7 @@ use my_remote_speaker::{
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -19,7 +20,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::aud::{
     SAMPLE_RATE,
     dcblocker::DcBlocker,
-    mixer::{MixerController, MixerOutput, Mixers},
+    mixer::{DeviceInfo, MixerController, MixerOutput, Mixers},
 };
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
@@ -28,12 +29,14 @@ type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerErr
 fn on_device_add(
     dev_id_str: String,
     dev_id: cpal::DeviceId,
+    desc: Option<cpal::DeviceDescription>,
     dh: &mut DeviceHandles,
-    mixers: &mut Mixers,
+    mixers: &Mixers,
     tm: &TaskManager,
 ) {
     let dev_id_2 = dev_id.clone();
-    let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_id);
+    let dev_info = DeviceInfo::create(&dev_id_str, desc.as_ref());
+    let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
@@ -51,7 +54,7 @@ fn on_device_del(
     dev_id_str: String,
     dev_id: cpal::DeviceId,
     dh: &mut DeviceHandles,
-    mixers: &mut Mixers,
+    mixers: &Mixers,
     _tm: &TaskManager,
 ) {
     if let Some(task) = dh.remove(&dev_id) {
@@ -60,8 +63,7 @@ fn on_device_del(
     } else {
         warn!("Task not found.");
     };
-    // 设备没了，mixer 也杀：bundle drop → worker 取消 + 通道断开
-    mixers.remove(&dev_id);
+    mixers.remove(&dev_id_str);
 }
 
 /// - true: set blacklisted
@@ -71,8 +73,9 @@ fn on_device_online(
     dev_id_str: String,
     dev_id: cpal::DeviceId,
     blacklisted: bool,
+    description: Option<cpal::DeviceDescription>,
     dh: &mut DeviceHandles,
-    mixers: &mut Mixers,
+    mixers: &Mixers,
     tm: &TaskManager,
 ) -> bool {
     if let Some(task) = dh.get(&dev_id) {
@@ -84,7 +87,8 @@ fn on_device_online(
         }
     }
     let dev_id_2 = dev_id.clone();
-    let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_id);
+    let dev_info = DeviceInfo::create(&dev_id_str, description.as_ref());
+    let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
     let h = tm.spawn_blocking_typed(move |tc, ct| {
         tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
@@ -159,12 +163,12 @@ fn get_device_status(
     }
 }
 
-pub fn host_handler(tm: TaskManager, mut mixers: Mixers, ct: CancellationToken) {
+pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken) {
     let audio_host = cpal::default_host();
     enum Action {
-        OnDeviceAdd,
+        OnDeviceAdd(Option<cpal::DeviceDescription>),
         OnDeviceDel,
-        OnDeviceOnline(bool),
+        OnDeviceOnline(bool, Option<cpal::DeviceDescription>),
     }
     let mut device_handles: DeviceHandles = HashMap::new();
     // `value = true` -> blacklisted (device unsupported)
@@ -184,11 +188,12 @@ pub fn host_handler(tm: TaskManager, mut mixers: Mixers, ct: CancellationToken) 
                 Ok(d) => d,
                 Err(_) => continue, // device suddenly disconnected
             };
+            let description = dev.description().ok();
             current_devices.insert(dev_id.clone());
             if let Some(blacklisted) = prev_devices.get(&dev_id) {
-                actions.insert(dev_id, Action::OnDeviceOnline(*blacklisted));
+                actions.insert(dev_id, Action::OnDeviceOnline(*blacklisted, description));
             } else {
-                actions.insert(dev_id.clone(), Action::OnDeviceAdd);
+                actions.insert(dev_id.clone(), Action::OnDeviceAdd(description));
                 prev_devices.insert(dev_id, false);
             }
         }
@@ -202,19 +207,25 @@ pub fn host_handler(tm: TaskManager, mut mixers: Mixers, ct: CancellationToken) 
         for (dev_id, action) in actions {
             let dev_id_str = dev_id.to_string();
             match action {
-                Action::OnDeviceAdd => {
-                    on_device_add(dev_id_str, dev_id, &mut device_handles, &mut mixers, &tm)
-                }
+                Action::OnDeviceAdd(description) => on_device_add(
+                    dev_id_str,
+                    dev_id,
+                    description,
+                    &mut device_handles,
+                    &mixers,
+                    &tm,
+                ),
                 Action::OnDeviceDel => {
-                    on_device_del(dev_id_str, dev_id, &mut device_handles, &mut mixers, &tm)
+                    on_device_del(dev_id_str, dev_id, &mut device_handles, &mixers, &tm)
                 }
-                Action::OnDeviceOnline(blacklisted) => {
+                Action::OnDeviceOnline(blacklisted, description) => {
                     let should_blacklist_this = on_device_online(
                         dev_id_str,
                         dev_id.clone(),
                         blacklisted,
+                        description,
                         &mut device_handles,
-                        &mut mixers,
+                        &mixers,
                         &tm,
                     );
                     if should_blacklist_this {
