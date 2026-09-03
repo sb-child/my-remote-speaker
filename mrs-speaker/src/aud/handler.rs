@@ -329,6 +329,9 @@ fn stream_handler(
     sel.add(&restart_rx);
     sel.add(&events_rx);
     loop {
+        if ct.is_cancelled() {
+            return Ok(());
+        }
         info!("Building output stream...");
         mixer_ctrl.reset();
         let mc_for_err_cb = mixer_ctrl.clone();
