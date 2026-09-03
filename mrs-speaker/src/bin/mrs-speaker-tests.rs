@@ -23,7 +23,7 @@ pub struct Cli {
 /// sub-commands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    AudioHandler,
+    Audio,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ct = CancellationToken::new();
     let tm = TaskManager::new();
     let t = match args.command {
-        Commands::AudioHandler => audio_handler_test(tm.clone(), ct.child_token()),
+        Commands::Audio => audio_test(tm.clone(), ct.child_token()),
     };
     info!("Starting task {}.", task_name);
     let r = rt.block_on(async {
@@ -64,17 +64,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // -------
 
-async fn audio_handler_test(
+async fn audio_test(
     tm: TaskManager,
     ct: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ct2 = ct.clone();
-    let mixers = Arc::new(aud::mixer::Mixers::new(tm.clone(), ct2.clone()));
+    let _g = ct.drop_guard_ref();
+    let mixers = Arc::new(aud::mixer::Mixers::new(tm.clone(), ct.clone()));
+
+    info!("spawn host_handler.");
+    let mixers2 = mixers.clone();
     let h = tm.spawn_blocking_typed(move |tm, pu, ct| {
         pu.update(());
-        aud::handler::host_handler(tm, mixers, ct);
+        aud::handler::host_handler(tm, mixers2, ct);
         Ok::<(), ()>(())
     });
+    h.cancel_at(&ct);
+
+    info!("get device.");
+    let dev_id = "pipewire:dc_blocker_sink_EDIFIER_M16_Pro";
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mh = mixers.handle(dev_id).ok_or("No device found.")?;
+
+    info!("test done.");
     tokio::time::sleep(Duration::from_secs(5)).await;
     warn!("Triggering CancellationToken.");
     ct.cancel();
