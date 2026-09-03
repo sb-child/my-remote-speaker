@@ -132,15 +132,12 @@ fn select_mixer_channel(
 ) {
     if res == *trig_rx {
         match trig_rx.read_select(res) {
-            Ok((size, r)) => {
-                if let Some(frame_tx) = r {
-                    let buf = mixer_mix_tracks(size, tracks);
-                    // 如果 frame_rx 被 drop，这里发送的 buf 会自动 drop。
-                    frame_tx.send(buf);
-                } else {
-                    mixer_seek_tracks(size, tracks);
-                }
+            Ok(MixerTriggerPayload::Read(size, mut buf, frame_tx)) => {
+                mixer_mix_tracks(size, &mut buf, tracks);
+                // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
+                frame_tx.send(buf);
             }
+            Ok(MixerTriggerPayload::Seek(size)) => mixer_seek_tracks(size, tracks),
             Err(RecvError) => sel.remove(trig_rx),
         }
     } else if res == *cmd_rx {
@@ -151,10 +148,8 @@ fn select_mixer_channel(
     }
 }
 
-fn mixer_mix_tracks(items: usize, tracks: &mut HashMap<TrackId, Track>) -> Vec<f32> {
-    let buf = Vec::new();
+fn mixer_mix_tracks(items: usize, buf: &mut Vec<f32>, tracks: &mut HashMap<TrackId, Track>) {
     // todo: mix tracks
-    buf
 }
 
 fn mixer_seek_tracks(items: usize, tracks: &mut HashMap<TrackId, Track>) {
