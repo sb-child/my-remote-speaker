@@ -1,7 +1,7 @@
 use cpal::{
-    BufferSize, DeviceType, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedOutputConfigs,
-    SupportedStreamConfig, SupportedStreamConfigRange,
-    traits::{DeviceTrait, HostTrait, StreamTrait as _},
+    BufferSize, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedOutputConfigs,
+    SupportedStreamConfigRange,
+    traits::{DeviceTrait, HostTrait},
 };
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager, TypedTaskState},

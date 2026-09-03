@@ -1,5 +1,7 @@
 use crate::aud::SAMPLE_RATE;
-use crossfire::{BlockingTxTrait, RecvError, RecvTimeoutError, SendTimeoutError, select::Select};
+use crossfire::{
+    BlockingRxTrait, BlockingTxTrait, RecvError, RecvTimeoutError, SendTimeoutError, select::Select,
+};
 use dashmap::DashMap;
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager},
@@ -9,13 +11,13 @@ use my_remote_speaker::{
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// 混音器管理器
 ///
@@ -111,9 +113,39 @@ fn worker_panicked(b: &MixerBundle) -> bool {
 use_id!(Track);
 
 type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
+
+/// 空闲待机模式
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandbyMode {
+    /// 默认所有轨道空闲`STANDBY_DELAY`时暂停 stream，在轨道有内容时恢复。
+    Auto,
+    /// 强制 stream 一直保持运行
+    ForcePlay,
+}
+
+impl Default for StandbyMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// 空闲请求待机延迟
+const STANDBY_DELAY: Duration = Duration::from_secs(2);
+
+/// mixer worker 的空闲/待机状态机
+#[derive(Default)]
+struct StandbyState {
+    mode: StandbyMode,
+    /// 连续空闲的开始时刻
+    idle_since: Option<Instant>,
+    /// 已触发过待机请求
+    fired: bool,
+}
+
 pub enum MixerCmd {
     AddTracks(Vec<Track>, OneshotTx<Vec<TrackId>>),
     RemoveTrack(Vec<TrackId>, OneshotTx<Vec<bool>>),
+    SetStandbyMode(StandbyMode, OneshotTx<()>),
 }
 
 type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
@@ -194,13 +226,14 @@ fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken)
     let mut tracks: HashMap<TrackId, Track> = HashMap::new();
     let track_counter = TrackIdCounter::default();
     let mut mixer_buf = Vec::new();
+    let mut standby = StandbyState::default();
     let mut sel = Select::new();
     sel.add(&trig_rx);
     sel.add(&cmd_rx);
     loop {
         match sel.select_timeout(Duration::from_millis(50)) {
             Ok(res) => {
-                select_mixer_channel(
+                let read_happened = select_mixer_channel(
                     &trig_rx,
                     &cmd_rx,
                     &mut sel,
@@ -208,7 +241,9 @@ fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken)
                     &mut tracks,
                     &mut mixer_buf,
                     &track_counter,
+                    &mut standby,
                 );
+                mixer_update_idle(read_happened, &tracks, &mut standby);
                 if ct.is_cancelled() {
                     return;
                 }
@@ -223,6 +258,7 @@ fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken)
     }
 }
 
+/// 消费一个通道事件。返回 true 表示本次处理了一个 Read（混音完成）。
 fn select_mixer_channel(
     trig_rx: &MixerTrigRx,
     cmd_rx: &MixerCmdRx,
@@ -231,7 +267,8 @@ fn select_mixer_channel(
     tracks: &mut HashMap<TrackId, Track>,
     mixer_buf: &mut Vec<f32>,
     track_counter: &TrackIdCounter,
-) {
+    standby: &mut StandbyState,
+) -> bool {
     if res == *trig_rx {
         match trig_rx.read_select(res) {
             Ok(MixerTriggerPayload::Read(size, mut buf, frame_tx)) => {
@@ -242,15 +279,41 @@ fn select_mixer_channel(
                 mixer_mix_tracks(&mut buf, mixer_buf, tracks);
                 // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
                 frame_tx.send(buf);
+                return true;
             }
             Ok(MixerTriggerPayload::Seek(size)) => mixer_seek_tracks(size, tracks),
             Err(RecvError) => sel.remove(trig_rx),
         }
     } else if res == *cmd_rx {
         match cmd_rx.read_select(res) {
-            Ok(cmd) => mixer_handle_cmd(cmd, tracks, track_counter),
+            Ok(cmd) => mixer_handle_cmd(cmd, tracks, track_counter, standby),
             Err(RecvError) => sel.remove(cmd_rx),
         }
+    }
+    false
+}
+
+/// 累加空闲计时
+fn mixer_update_idle(read_happened: bool, tracks: &HashMap<TrackId, Track>, st: &mut StandbyState) {
+    if !read_happened {
+        return; // 只在 Read 事件后才更新。
+    }
+    if st.mode == StandbyMode::ForcePlay {
+        st.idle_since = None;
+        st.fired = false;
+        return;
+    }
+    let now = Instant::now();
+    if tracks.values().all(Track::is_idle) {
+        let since = st.idle_since.get_or_insert(now);
+        if !st.fired && now.duration_since(*since) >= STANDBY_DELAY {
+            st.fired = true;
+            // todo: 把待机信号发给 MixerController
+            warn!(idle_for = ?now.duration_since(*since), "all tracks idle, requesting standby.");
+        }
+    } else {
+        st.idle_since = None;
+        st.fired = false;
     }
 }
 
@@ -260,11 +323,11 @@ fn mixer_mix_tracks(
     tracks: &mut HashMap<TrackId, Track>,
 ) {
     for track in tracks.values_mut() {
-        let n = track.read_frames(mixer_buf);
+        track.read_frames(mixer_buf);
         // todo: 这里会爆炸，要加上削波算法
-        out_buf[..n]
+        out_buf
             .iter_mut()
-            .zip(&mixer_buf[..n])
+            .zip(mixer_buf.iter())
             .for_each(|(o, &s)| *o += s);
     }
 }
@@ -279,6 +342,7 @@ fn mixer_handle_cmd(
     cmd: MixerCmd,
     state: &mut HashMap<TrackId, Track>,
     track_counter: &TrackIdCounter,
+    standby: &mut StandbyState,
 ) {
     match cmd {
         MixerCmd::AddTracks(tracks, tx_oneshot) => {
@@ -286,6 +350,13 @@ fn mixer_handle_cmd(
         }
         MixerCmd::RemoveTrack(track_ids, tx_oneshot) => {
             tx_oneshot.send(mixer_on_remove_tracks(track_ids, state))
+        }
+        MixerCmd::SetStandbyMode(mode, tx_oneshot) => {
+            standby.mode = mode;
+            // 切模式重置计时：Auto 从零开始累计，切换后有一整段 grace
+            standby.idle_since = None;
+            standby.fired = false;
+            tx_oneshot.send(());
         }
     };
 }
@@ -318,6 +389,30 @@ fn mixer_on_remove_tracks(
 #[derive(Clone)]
 pub struct MixerHandle {
     cmd_tx: MixerCmdTx,
+}
+
+/// MixerHandle 命令错误
+#[derive(Debug, PartialEq, Eq)]
+pub enum MixerCmdError {
+    /// 命令通道积压或断开
+    Send,
+    /// mixer worker 无响应
+    Timeout,
+}
+
+impl MixerHandle {
+    /// 设置空闲待机模式。
+    /// - Auto：空闲超时自动待机。
+    /// - ForcePlay：保持播放不待机。
+    pub fn set_standby_mode(&self, mode: StandbyMode) -> Result<(), MixerCmdError> {
+        let (tx, rx) = crossfire::oneshot::oneshot();
+        self.cmd_tx
+            .send_timeout(MixerCmd::SetStandbyMode(mode, tx), Duration::from_secs(1))
+            .map_err(|_| MixerCmdError::Send)?;
+        rx.recv_timeout(Duration::from_secs(1))
+            .map(|_| ())
+            .map_err(|_| MixerCmdError::Timeout)
+    }
 }
 
 #[derive(Clone)]
@@ -492,24 +587,31 @@ impl Track {
         items - remaining
     }
 
-    /// 读取音频轨道，填充 data。返回成功填充的元素数。
-    pub fn read_frames(&mut self, mut data: &mut [f32]) -> usize {
-        let total_requested = data.len();
-        while !data.is_empty() {
+    /// 读取音频轨道，填满 data。内容不足的部分补 0。
+    pub fn read_frames(&mut self, data: &mut [f32]) {
+        let mut written = 0;
+        while written < data.len() {
             if self.current_clip.is_none() && !self.try_fetch_next_clip() {
                 break;
             }
-            if let Some((clip, pos)) = self.current_clip.as_mut() {
-                let n = clip.read_frames(*pos, data);
-                if n == 0 {
-                    self.current_clip = None;
-                } else {
-                    *pos += n;
-                    data = &mut data[n..];
-                }
+            let (clip, pos) = self.current_clip.as_mut().expect("fetched above");
+            let n = clip.read_frames(*pos, &mut data[written..]);
+            *pos += n;
+            written += n;
+            if clip.is_empty() {
+                self.current_clip = None;
             }
         }
-        total_requested - data.len()
+        data[written..].fill(0.0);
+    }
+
+    /// 轨道是否空闲
+    pub fn is_idle(&self) -> bool {
+        let current_done = self
+            .current_clip
+            .as_ref()
+            .map_or(true, |(g, _)| g.is_empty());
+        current_done && self.clip_queue_rx.is_empty()
     }
 
     /// 尝试从 Rx 队列中拉取下一个可用的 Clip
@@ -693,6 +795,11 @@ impl ClipGroup {
         }
         self.pos += written; // 更新进度
         written
+    }
+
+    /// ClipGroup 内是否已没有可播放的 Clip
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clips.is_empty()
     }
 
     pub fn into_current_clip(self) -> Option<(Self, usize)> {
