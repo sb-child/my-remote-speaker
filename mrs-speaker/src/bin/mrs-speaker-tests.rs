@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
-use mrs_speaker::aud;
+use mrs_speaker::aud::{
+    self,
+    handler::host_handler,
+    mixer::{Clip, ClipGroup, Mixers, Track},
+};
 use my_remote_speaker::task::TaskManager;
-use std::{sync::Arc, time::Duration};
+use std::{ops::Index, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -69,13 +73,13 @@ async fn audio_test(
     ct: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _g = ct.drop_guard_ref();
-    let mixers = Arc::new(aud::mixer::Mixers::new(tm.clone(), ct.clone()));
+    let mixers = Arc::new(Mixers::new(tm.clone(), ct.clone()));
 
     info!("spawn host_handler.");
     let mixers2 = mixers.clone();
     let h = tm.spawn_blocking_typed(move |tm, pu, ct| {
         pu.update(());
-        aud::handler::host_handler(tm, mixers2, ct);
+        host_handler(tm, mixers2, ct);
         Ok::<(), ()>(())
     });
     h.cancel_at(&ct);
@@ -85,10 +89,34 @@ async fn audio_test(
     tokio::time::sleep(Duration::from_secs(1)).await;
     let mh = mixers.handle(dev_id).ok_or("No device found.")?;
 
+    info!("create track.");
+    let (track, th) = Track::new();
+    let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
+    let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
+    let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
+    th.push_clip_group(clipgroup).await?;
+    let track = mh.add_tracks(vec![track]).map_err(|e| format!("{:?}", e))?;
+    let track_id = track.get(0).ok_or("no track id.")?;
+
     info!("test done.");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
     warn!("Triggering CancellationToken.");
     ct.cancel();
     h.wait_terminal().await;
     Ok(())
+}
+
+fn generate_440hz_stereo(duration_secs: f32, left_pan: f32, right_pan: f32) -> Vec<f32> {
+    const SAMPLE_RATE: f32 = 48000.0;
+    const FREQUENCY: f32 = 440.0;
+    let frames = (SAMPLE_RATE * duration_secs) as usize;
+    let total_samples = frames * 2;
+    let mut buffer = Vec::with_capacity(total_samples);
+    let omega = 2.0 * std::f32::consts::PI * FREQUENCY / SAMPLE_RATE;
+    for i in 0..frames {
+        let sample = (i as f32 * omega).sin();
+        buffer.push(sample * left_pan);
+        buffer.push(sample * right_pan);
+    }
+    buffer
 }

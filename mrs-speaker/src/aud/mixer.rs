@@ -306,6 +306,7 @@ fn select_mixer_channel(
                 mixer_buf.clear();
                 mixer_buf.reserve(size.saturating_sub(mixer_buf.capacity()));
                 mixer_buf.resize(size, 0.0);
+                mixer_buf.fill(0.0);
                 mixer_mix_tracks(&mut buf, mixer_buf, tracks);
                 // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
                 frame_tx.send(buf);
@@ -462,6 +463,28 @@ impl MixerHandle {
             .map_err(|_| MixerCmdError::Send)?;
         rx.recv_timeout(Duration::from_secs(1))
             .map(|_| ())
+            .map_err(|_| MixerCmdError::Timeout)
+    }
+
+    /// 把轨道挂上 mixer，返回每个轨道分配到的 [TrackId]。
+    ///
+    /// 建议通过 [TrackHandle::push_clip_group] / [TrackHandle::try_push_clip_group] 把内容提前推进去再挂。
+    pub fn add_tracks(&self, tracks: Vec<Track>) -> Result<Vec<TrackId>, MixerCmdError> {
+        let (tx, rx) = crossfire::oneshot::oneshot();
+        self.cmd_tx
+            .send_timeout(MixerCmd::AddTracks(tracks, tx), Duration::from_secs(1))
+            .map_err(|_| MixerCmdError::Send)?;
+        rx.recv_timeout(Duration::from_secs(1))
+            .map_err(|_| MixerCmdError::Timeout)
+    }
+
+    /// 把轨道从 mixer 上摘下来，返回每个 id 是否实际存在并被移除。
+    pub fn remove_tracks(&self, track_ids: Vec<TrackId>) -> Result<Vec<bool>, MixerCmdError> {
+        let (tx, rx) = crossfire::oneshot::oneshot();
+        self.cmd_tx
+            .send_timeout(MixerCmd::RemoveTrack(track_ids, tx), Duration::from_secs(1))
+            .map_err(|_| MixerCmdError::Send)?;
+        rx.recv_timeout(Duration::from_secs(1))
             .map_err(|_| MixerCmdError::Timeout)
     }
 }
@@ -689,7 +712,23 @@ pub struct TrackHandle {
     clip_queue_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<ClipGroup>>,
 }
 
-impl TrackHandle {}
+impl TrackHandle {
+    /// 把一个 [ClipGroup] 送入轨道播放队列末尾。
+    pub async fn push_clip_group(
+        &self,
+        group: ClipGroup,
+    ) -> Result<(), crossfire::SendError<ClipGroup>> {
+        self.clip_queue_tx.send(group).await
+    }
+
+    /// 非阻塞推送 [ClipGroup]。队列积压满时返回 `Err(Full)`。
+    pub fn try_push_clip_group(
+        &self,
+        group: ClipGroup,
+    ) -> Result<(), crossfire::TrySendError<ClipGroup>> {
+        self.clip_queue_tx.try_send(group)
+    }
+}
 
 pub struct Clip {
     /// Clip 的音频数据
@@ -874,4 +913,86 @@ pub struct ClipGroupHandle {
     skip: Arc<AtomicBool>,
     timeout: Arc<AtomicBool>,
     done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use my_remote_speaker::task::TaskManager;
+    use tokio_util::sync::CancellationToken;
+
+    fn new_mixers(dev: &str) -> (Mixers, MixerHandle, MixerController, MixerOutput) {
+        let tm = TaskManager::new();
+        let ct = CancellationToken::new();
+        let mixers = Mixers::new(tm, ct);
+        let (handle, ctrl, out) = mixers.get_or_create(&DeviceInfo::create(dev, None));
+        (mixers, handle, ctrl, out)
+    }
+
+    /// 全链路：try_push 内容 → add_tracks → read_frames 出声（连续读不叠加）→ 播完静音 → remove
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_tracks_read_remove() {
+        let (mixers, handle, _ctrl, mut out) = new_mixers("test-device");
+        assert!(mixers.handle("test-device").is_some());
+
+        // 20ms 的 0.25 常量音：48000Hz * 2ch * 0.02s = 1920 元素
+        let sample = vec![0.25f32; 1920];
+        let (clip, _clip_h) = Clip::new(sample);
+        let (group, _group_h) = ClipGroup::new(vec![clip]);
+        let (track, th) = Track::new();
+        th.try_push_clip_group(group).unwrap();
+
+        let ids = handle.add_tracks(vec![track]).unwrap();
+        assert_eq!(ids.len(), 1);
+
+        // 第一帧（960 元素 = 10ms）：全 0.25
+        let mut buf = vec![0.0f32; 960];
+        let n = out.read_frames(&mut buf, Duration::from_millis(200));
+        assert_eq!(n, 960);
+        assert!(buf.iter().all(|&s| s == 0.25));
+
+        // 第二帧：乒乓 buffer 复用，值仍应是 0.25 而不是 0.5（回归：mixer_mix_tracks 漏 fill）
+        let n = out.read_frames(&mut buf, Duration::from_millis(200));
+        assert_eq!(n, 960);
+        assert!(
+            buf.iter().all(|&s| s == 0.25),
+            "buffer reuse must not accumulate"
+        );
+
+        // 内容播完（960+960=1920）：第三帧应全 0
+        let n = out.read_frames(&mut buf, Duration::from_millis(200));
+        assert_eq!(n, 960);
+        assert!(buf.iter().all(|&s| s == 0.0));
+
+        // 移除：第一次存在，第二次不存在
+        assert_eq!(handle.remove_tracks(ids.clone()).unwrap(), vec![true]);
+        assert_eq!(handle.remove_tracks(ids).unwrap(), vec![false]);
+    }
+
+    /// async 推送形态 + 多轨混音：两轨 0.25 叠加 = 0.5
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_async_and_mix_two_tracks() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-device-mix");
+
+        let mut tracks = Vec::new();
+        for _ in 0..2 {
+            let (clip, _ch) = Clip::new(vec![0.25f32; 960]);
+            let (group, _gh) = ClipGroup::new(vec![clip]);
+            let (track, th) = Track::new();
+            th.push_clip_group(group).await.unwrap();
+            tracks.push(track);
+        }
+        let ids = handle.add_tracks(tracks).unwrap();
+        assert_eq!(ids.len(), 2);
+
+        let mut buf = vec![0.0f32; 960];
+        let n = out.read_frames(&mut buf, Duration::from_millis(200));
+        assert_eq!(n, 960);
+        assert!(
+            buf.iter().all(|&s| s == 0.5),
+            "two 0.25 tracks should sum to 0.5"
+        );
+
+        handle.remove_tracks(ids).unwrap();
+    }
 }
