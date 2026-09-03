@@ -146,6 +146,7 @@ pub enum MixerCmd {
     AddTracks(Vec<Track>, OneshotTx<Vec<TrackId>>),
     RemoveTrack(Vec<TrackId>, OneshotTx<Vec<bool>>),
     SetStandbyMode(StandbyMode, OneshotTx<()>),
+    Resume((), OneshotTx<()>),
 }
 
 type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
@@ -353,9 +354,12 @@ fn mixer_handle_cmd(
         }
         MixerCmd::SetStandbyMode(mode, tx_oneshot) => {
             standby.mode = mode;
-            // 切模式重置计时：Auto 从零开始累计，切换后有一整段 grace
-            standby.idle_since = None;
-            standby.fired = false;
+            standby.idle_since = None; // 重置计时
+            standby.fired = false; // 恢复标志
+            tx_oneshot.send(());
+        }
+        MixerCmd::Resume(_, tx_oneshot) => {
+            // todo: 把唤醒信号发给 MixerController
             tx_oneshot.send(());
         }
     };
@@ -408,6 +412,16 @@ impl MixerHandle {
         let (tx, rx) = crossfire::oneshot::oneshot();
         self.cmd_tx
             .send_timeout(MixerCmd::SetStandbyMode(mode, tx), Duration::from_secs(1))
+            .map_err(|_| MixerCmdError::Send)?;
+        rx.recv_timeout(Duration::from_secs(1))
+            .map(|_| ())
+            .map_err(|_| MixerCmdError::Timeout)
+    }
+
+    pub fn resume(&self) -> Result<(), MixerCmdError> {
+        let (tx, rx) = crossfire::oneshot::oneshot();
+        self.cmd_tx
+            .send_timeout(MixerCmd::Resume((), tx), Duration::from_secs(1))
             .map_err(|_| MixerCmdError::Send)?;
         rx.recv_timeout(Duration::from_secs(1))
             .map(|_| ())
