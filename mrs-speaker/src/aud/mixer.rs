@@ -102,6 +102,7 @@ fn spawn_mixer_worker(
 
 fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken) {
     let mut tracks: HashMap<TrackId, Track> = HashMap::new();
+    let track_counter = TrackIdCounter::default();
     let mut mixer_buf = Vec::new();
     let mut sel = Select::new();
     sel.add(&trig_rx);
@@ -116,6 +117,7 @@ fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken)
                     res,
                     &mut tracks,
                     &mut mixer_buf,
+                    &track_counter,
                 );
                 if ct.is_cancelled() {
                     return;
@@ -138,6 +140,7 @@ fn select_mixer_channel(
     res: crossfire::select::SelectResult,
     tracks: &mut HashMap<TrackId, Track>,
     mixer_buf: &mut Vec<f32>,
+    track_counter: &TrackIdCounter,
 ) {
     if res == *trig_rx {
         match trig_rx.read_select(res) {
@@ -146,7 +149,7 @@ fn select_mixer_channel(
                 mixer_buf.clear();
                 mixer_buf.reserve(size.saturating_sub(mixer_buf.capacity()));
                 mixer_buf.resize(size, 0.0);
-                mixer_mix_tracks(size, &mut buf, tracks, mixer_buf);
+                mixer_mix_tracks(&mut buf, mixer_buf, tracks);
                 // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
                 frame_tx.send(buf);
             }
@@ -155,29 +158,41 @@ fn select_mixer_channel(
         }
     } else if res == *cmd_rx {
         match cmd_rx.read_select(res) {
-            Ok(cmd) => mixer_handle_cmd(cmd, tracks),
+            Ok(cmd) => mixer_handle_cmd(cmd, tracks, track_counter),
             Err(RecvError) => sel.remove(cmd_rx),
         }
     }
 }
 
 fn mixer_mix_tracks(
-    items: usize,
-    out_buf: &mut Vec<f32>,
+    out_buf: &mut [f32],
+    mixer_buf: &mut [f32],
     tracks: &mut HashMap<TrackId, Track>,
-    mixer_buf: &mut Vec<f32>,
 ) {
-    // todo: mix tracks
+    for track in tracks.values_mut() {
+        let n = track.read_frames(mixer_buf);
+        // todo: 这里会爆炸，要加上削波算法
+        out_buf[..n]
+            .iter_mut()
+            .zip(&mixer_buf[..n])
+            .for_each(|(o, &s)| *o += s);
+    }
 }
 
 fn mixer_seek_tracks(items: usize, tracks: &mut HashMap<TrackId, Track>) {
-    // todo
+    tracks.values_mut().for_each(|track| {
+        let _ = track.skip_frames(items);
+    });
 }
 
-fn mixer_handle_cmd(cmd: MixerCmd, state: &mut HashMap<TrackId, Track>) {
+fn mixer_handle_cmd(
+    cmd: MixerCmd,
+    state: &mut HashMap<TrackId, Track>,
+    track_counter: &TrackIdCounter,
+) {
     match cmd {
         MixerCmd::AddTracks(tracks, tx_oneshot) => {
-            tx_oneshot.send(mixer_on_add_tracks(tracks, state))
+            tx_oneshot.send(mixer_on_add_tracks(tracks, state, track_counter))
         }
         MixerCmd::RemoveTrack(track_ids, tx_oneshot) => {
             tx_oneshot.send(mixer_on_remove_tracks(track_ids, state))
@@ -188,15 +203,26 @@ fn mixer_handle_cmd(cmd: MixerCmd, state: &mut HashMap<TrackId, Track>) {
 fn mixer_on_add_tracks(
     tracks_to_add: Vec<Track>,
     state: &mut HashMap<TrackId, Track>,
+    track_counter: &TrackIdCounter,
 ) -> Vec<TrackId> {
-    Vec::new()
+    tracks_to_add
+        .into_iter()
+        .map(|t| {
+            let id = track_counter.next();
+            state.insert(id, t);
+            id
+        })
+        .collect()
 }
 
 fn mixer_on_remove_tracks(
     tracks_to_remove: Vec<TrackId>,
     state: &mut HashMap<TrackId, Track>,
 ) -> Vec<bool> {
-    Vec::new()
+    tracks_to_remove
+        .iter()
+        .map(|id| state.remove(id).is_some())
+        .collect()
 }
 
 pub struct MixerHandle {
