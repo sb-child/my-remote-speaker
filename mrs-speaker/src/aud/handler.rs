@@ -1,8 +1,14 @@
+use crate::aud::{
+    SAMPLE_RATE,
+    dcblocker::DcBlocker,
+    mixer::{DeviceInfo, MixerController, MixerEvent, MixerEventRx, MixerOutput, Mixers},
+};
 use cpal::{
     BufferSize, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedOutputConfigs,
     SupportedStreamConfigRange,
-    traits::{DeviceTrait, HostTrait},
+    traits::{DeviceTrait, HostTrait, StreamTrait as _},
 };
+use crossfire::{RecvError, RecvTimeoutError, select::Select};
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager, TypedTaskState},
     util::IteratorExt as _,
@@ -16,12 +22,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
-
-use crate::aud::{
-    SAMPLE_RATE,
-    dcblocker::DcBlocker,
-    mixer::{DeviceInfo, MixerController, MixerOutput, Mixers},
-};
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
 
@@ -323,13 +323,17 @@ fn stream_handler(
     mixer_out: MixerOutput,
     ct: CancellationToken,
 ) -> Result<(), StreamHandlerError> {
+    let (restart_tx, restart_rx) = crossfire::mpsc::bounded_blocking(16);
+    let events_rx = mixer_ctrl.events();
+    let mut sel = Select::new();
+    sel.add(&restart_rx);
+    sel.add(&events_rx);
     loop {
         info!("Building output stream...");
         mixer_ctrl.reset();
         let mc_for_err_cb = mixer_ctrl.clone();
         let mut mo_for_stream_cb = mixer_out.clone();
-        // let mo_for_err_cb = mixer_out.clone();
-        let (restart_tx, restart_rx) = crossfire::mpsc::bounded_blocking(16);
+        let restart_tx_cb = restart_tx.clone();
         let mut temp_buf: Vec<f32> = vec![];
         let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
         let stream_res = if support_f32 {
@@ -345,7 +349,7 @@ fn stream_handler(
                         &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx),
+                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx_cb),
                 Some(device_wait_timeout),
             )
         } else {
@@ -361,7 +365,7 @@ fn stream_handler(
                         &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx),
+                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx_cb),
                 Some(device_wait_timeout),
             )
         };
@@ -385,30 +389,78 @@ fn stream_handler(
         };
         info!("Stream started, waiting for events.");
         loop {
-            if ct.is_cancelled() {
-                warn!("Cancelled.");
-                return Ok(());
+            match stream_handle_event(&mut sel, &restart_rx, &events_rx, &ct) {
+                StreamAction::Exit => return Ok(()),
+                StreamAction::Restart { source } => {
+                    warn!("Device disconnected. Restarting device handler: {}", source);
+                    return Err(StreamHandlerError::DeviceDisconnected { source });
+                }
+                StreamAction::Play => {
+                    dc_blocker_handle.reset();
+                    if let Err(e) = stream.play() {
+                        return Err(StreamHandlerError::OtherDeviceError { source: e });
+                    }
+                }
+                StreamAction::Pause => {
+                    if let Err(e) = stream.pause() {
+                        return Err(StreamHandlerError::OtherDeviceError { source: e });
+                    }
+                    dc_blocker_handle.reset();
+                }
+                StreamAction::Ignore => {}
             }
-            match restart_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(e) => {
-                    warn!("Device disconnected. Restarting device handler: {}", e);
-                    return Err(StreamHandlerError::DeviceDisconnected { source: e });
-                }
-                Err(crossfire::RecvTimeoutError::Disconnected) => {
-                    warn!("Error channel disconnected. Restarting stream handler.");
-                    break;
-                }
-                Err(crossfire::RecvTimeoutError::Timeout) => {}
-            };
         }
-        // todo:
-        // wait for mixer commands
-        // call dc_blocker_handle.reset() after stream.pause()
-        // call dc_blocker_handle.reset() before stream.play()
-        // wait for CancellationToken
-        // wait any err_cb error happens
     }
-    // Ok(())
+}
+
+/// stream_handler 事件循环的处理结果
+enum StreamAction {
+    /// ct 取消，正常退出。
+    Exit,
+    /// 重启 device handler。
+    Restart { source: cpal::Error },
+    /// mixer 请求恢复流。
+    Play,
+    /// mixer 请求暂停流。
+    Pause,
+    /// 无动作。
+    Ignore,
+}
+
+/// 等待并处理一个事件，返回对应动作。
+fn stream_handle_event(
+    sel: &mut Select<'_>,
+    restart_rx: &crossfire::Rx<crossfire::mpsc::Array<cpal::Error>>,
+    events_rx: &MixerEventRx,
+    ct: &CancellationToken,
+) -> StreamAction {
+    match sel.select_timeout(Duration::from_millis(100)) {
+        Ok(res) => {
+            if res == *restart_rx {
+                match restart_rx.read_select(res) {
+                    Ok(e) => StreamAction::Restart { source: e },
+                    Err(RecvError) => StreamAction::Ignore, // 不应该
+                }
+            } else if res == *events_rx {
+                match events_rx.read_select(res) {
+                    Ok(MixerEvent::RequestStandby) => StreamAction::Pause,
+                    Ok(MixerEvent::RequestResume) => StreamAction::Play,
+                    // mixer 死了，events_rx 断了。
+                    Err(RecvError) => StreamAction::Ignore,
+                }
+            } else {
+                StreamAction::Ignore
+            }
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            if ct.is_cancelled() {
+                StreamAction::Exit
+            } else {
+                StreamAction::Ignore
+            }
+        }
+        Err(RecvTimeoutError::Disconnected) => StreamAction::Exit,
+    }
 }
 
 fn stream_error_callback(

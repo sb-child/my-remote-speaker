@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// 混音器管理器
 ///
@@ -114,6 +114,18 @@ use_id!(Track);
 
 type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 
+/// mixer 到 device 的控制事件
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixerEvent {
+    /// 请求暂停流。
+    RequestStandby,
+    /// 请求恢复流。
+    RequestResume,
+}
+
+type MixerEventTx = crossfire::MTx<crossfire::mpmc::Array<MixerEvent>>;
+pub type MixerEventRx = crossfire::MRx<crossfire::mpmc::Array<MixerEvent>>;
+
 /// 空闲待机模式
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandbyMode {
@@ -183,12 +195,21 @@ impl Mixer {
         let mixer_ct = ct.child_token();
         let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
         let (cmd_tx, cmd_rx) = crossfire::mpmc::bounded_blocking(16);
-        let worker = spawn_mixer_worker(tm, trig_rx.clone(), cmd_rx.clone(), &mixer_ct);
+        let (events_tx, events_rx) = crossfire::mpmc::bounded_blocking(16);
+        let worker = spawn_mixer_worker(
+            tm,
+            trig_rx.clone(),
+            cmd_rx.clone(),
+            events_tx.clone(),
+            &mixer_ct,
+        );
         let ct_guard = mixer_ct.drop_guard();
         let state = Arc::new(MixerLinkState {
             read_frames_errored: Default::default(),
             disconnected: Default::default(),
             disconnect_at: AtomicInstant::new(Instant::now()),
+            _events_tx: events_tx,
+            events_rx,
         });
         (
             Self {
@@ -212,18 +233,24 @@ fn spawn_mixer_worker(
     tm: &TaskManager,
     trig_rx: MixerTrigRx,
     cmd_rx: MixerCmdRx,
+    events_tx: MixerEventTx,
     ct: &CancellationToken,
 ) -> TaskHandle<(), (), ()> {
     let h = tm.spawn_blocking_typed(move |pc, ct| {
         pc.update(());
-        mixer_worker(trig_rx, cmd_rx, ct);
+        mixer_worker(trig_rx, cmd_rx, events_tx, ct);
         Ok(())
     });
     h.cancel_at(ct);
     h
 }
 
-fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken) {
+fn mixer_worker(
+    trig_rx: MixerTrigRx,
+    cmd_rx: MixerCmdRx,
+    events_tx: MixerEventTx,
+    ct: CancellationToken,
+) {
     let mut tracks: HashMap<TrackId, Track> = HashMap::new();
     let track_counter = TrackIdCounter::default();
     let mut mixer_buf = Vec::new();
@@ -242,9 +269,10 @@ fn mixer_worker(trig_rx: MixerTrigRx, cmd_rx: MixerCmdRx, ct: CancellationToken)
                     &mut tracks,
                     &mut mixer_buf,
                     &track_counter,
+                    &events_tx,
                     &mut standby,
                 );
-                mixer_update_idle(read_happened, &tracks, &mut standby);
+                mixer_update_idle(read_happened, &tracks, &mut standby, &events_tx);
                 if ct.is_cancelled() {
                     return;
                 }
@@ -268,6 +296,7 @@ fn select_mixer_channel(
     tracks: &mut HashMap<TrackId, Track>,
     mixer_buf: &mut Vec<f32>,
     track_counter: &TrackIdCounter,
+    events_tx: &MixerEventTx,
     standby: &mut StandbyState,
 ) -> bool {
     if res == *trig_rx {
@@ -287,7 +316,7 @@ fn select_mixer_channel(
         }
     } else if res == *cmd_rx {
         match cmd_rx.read_select(res) {
-            Ok(cmd) => mixer_handle_cmd(cmd, tracks, track_counter, standby),
+            Ok(cmd) => mixer_handle_cmd(cmd, tracks, track_counter, events_tx, standby),
             Err(RecvError) => sel.remove(cmd_rx),
         }
     }
@@ -295,7 +324,12 @@ fn select_mixer_channel(
 }
 
 /// 累加空闲计时
-fn mixer_update_idle(read_happened: bool, tracks: &HashMap<TrackId, Track>, st: &mut StandbyState) {
+fn mixer_update_idle(
+    read_happened: bool,
+    tracks: &HashMap<TrackId, Track>,
+    st: &mut StandbyState,
+    events_tx: &MixerEventTx,
+) {
     if !read_happened {
         return; // 只在 Read 事件后才更新。
     }
@@ -309,8 +343,9 @@ fn mixer_update_idle(read_happened: bool, tracks: &HashMap<TrackId, Track>, st: 
         let since = st.idle_since.get_or_insert(now);
         if !st.fired && now.duration_since(*since) >= STANDBY_DELAY {
             st.fired = true;
-            // todo: 把待机信号发给 MixerController
-            warn!(idle_for = ?now.duration_since(*since), "all tracks idle, requesting standby.");
+            // 向 device 发送待机信号
+            let _ = events_tx.send(MixerEvent::RequestStandby);
+            info!(idle_for = ?now.duration_since(*since), "all tracks idle, requesting standby.");
         }
     } else {
         st.idle_since = None;
@@ -343,6 +378,7 @@ fn mixer_handle_cmd(
     cmd: MixerCmd,
     state: &mut HashMap<TrackId, Track>,
     track_counter: &TrackIdCounter,
+    events_tx: &MixerEventTx,
     standby: &mut StandbyState,
 ) {
     match cmd {
@@ -359,7 +395,8 @@ fn mixer_handle_cmd(
             tx_oneshot.send(());
         }
         MixerCmd::Resume(_, tx_oneshot) => {
-            // todo: 把唤醒信号发给 MixerController
+            // 向 device 发送唤醒信号
+            let _ = events_tx.send(MixerEvent::RequestResume);
             tx_oneshot.send(());
         }
     };
@@ -449,6 +486,11 @@ impl MixerController {
         self.state
             .disconnect_at
             .store(Instant::now(), Ordering::Release);
+    }
+
+    /// 订阅 mixer 控制事件
+    pub fn events(&self) -> MixerEventRx {
+        self.state.events_rx.clone()
     }
 }
 
@@ -560,6 +602,9 @@ struct MixerLinkState {
     read_frames_errored: AtomicBool,
     disconnected: AtomicBool,
     disconnect_at: AtomicInstant,
+    /// unused
+    _events_tx: MixerEventTx,
+    events_rx: MixerEventRx,
 }
 
 /// 音频轨道
