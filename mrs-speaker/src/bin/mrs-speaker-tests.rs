@@ -41,13 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
     let task_name = format!("{:?}", args.command);
     let ct = CancellationToken::new();
+    let tm = TaskManager::new();
     let t = match args.command {
-        Commands::AudioHandler => audio_handler_test(ct.child_token()),
+        Commands::AudioHandler => audio_handler_test(tm.clone(), ct.child_token()),
     };
     info!("Starting task {}.", task_name);
     let r = rt.block_on(async {
         tokio::select! {
-            r = tokio::signal::ctrl_c() => { ct.cancel(); r.map_err(|e| Box::new(e).into()) }
+            r = tokio::signal::ctrl_c() => { tm.close(); ct.cancel(); r.map_err(|e| Box::new(e).into()) }
             r = t => { r.map_err(|e| e) }
         }
     });
@@ -63,18 +64,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // -------
 
-async fn audio_handler_test(ct: CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
-    let tm = TaskManager::new();
-    let tm2 = tm.clone();
+async fn audio_handler_test(
+    tm: TaskManager,
+    ct: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ct2 = ct.clone();
-    let mixers = Arc::new(aud::mixer::Mixers::new(tm2.clone(), ct2.clone()));
-    let h = tokio::task::spawn_blocking(move || {
-        aud::handler::host_handler(tm2, mixers, ct2);
+    let mixers = Arc::new(aud::mixer::Mixers::new(tm.clone(), ct2.clone()));
+    let h = tm.spawn_blocking_typed(move |pu, ct| {
+        pu.update(());
+        aud::handler::host_handler(tm, mixers, ct);
+        Ok::<(), ()>(())
     });
     tokio::time::sleep(Duration::from_secs(5)).await;
     warn!("Triggering CancellationToken.");
     ct.cancel();
-    tm.close();
-    h.await?;
+    h.wait_terminal();
     Ok(())
 }
