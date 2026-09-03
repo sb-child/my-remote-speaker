@@ -1073,4 +1073,262 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(h.status().is_completed(), "terminal state must be sticky");
     }
+
+    // ---- wait_for / wait_terminal 事件驱动等待 ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_terminal_returns_completed_value() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok::<Ret, Err>(42)
+        });
+        // spawn 后立刻等待（任务还处于 Pending），验证事件通知唤醒而非轮询
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
+            .await
+            .expect("wait_terminal should return promptly");
+        match ts {
+            TypedTaskState::Completed(v) => assert_eq!(*v, 42),
+            s => panic!("expected Completed(42), got {s:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_terminal_returns_failed() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            Err::<Ret, Err>("wait fail".to_string())
+        });
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
+            .await
+            .expect("wait_terminal should return promptly");
+        match ts {
+            TypedTaskState::Failed(e) => assert_eq!(e.as_str(), "wait fail"),
+            s => panic!("expected Failed, got {s:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_terminal_returns_panicked() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            panic!("wait panic payload");
+            #[allow(unreachable_code)]
+            Ok::<Ret, Err>(0)
+        });
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
+            .await
+            .expect("wait_terminal should return promptly");
+        match ts {
+            TypedTaskState::Panicked(msg) => assert!(msg.contains("wait panic payload")),
+            s => panic!("expected Panicked, got {s:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_terminal_immediate_when_already_terminal() {
+        let tm = mk_tm();
+        let h =
+            tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move { Ok::<Ret, Err>(9) });
+        assert!(
+            wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
+            "task should complete first"
+        );
+        // 已终态: wait 不依赖通知, 立即返回
+        let t0 = std::time::Instant::now();
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
+            .await
+            .expect("should return immediately");
+        assert!(t0.elapsed() < Duration::from_millis(100), "should not wait for a notification");
+        assert!(matches!(ts, TypedTaskState::Completed(v) if *v == 9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_terminal_on_blocking_task() {
+        let tm = mk_tm();
+        let h = tm.spawn_blocking_typed(|_pc: ProgressUpdater<Status>, _ct| Ok::<Ret, Err>(7));
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_terminal())
+            .await
+            .expect("blocking task should finish");
+        assert!(matches!(ts, TypedTaskState::Completed(v) if *v == 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_then_wait_terminal_returns_cancelled() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, ct| async move {
+            ct.cancelled().await; // 协作式: cancel 后立即退出
+            Ok::<Ret, Err>(1)
+        });
+        h.cancel();
+        let ts = tokio::time::timeout(Duration::from_secs(3), h.wait_terminal())
+            .await
+            .expect("cancel should settle promptly");
+        assert!(ts.is_cancelled(), "expected Cancelled, got {ts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_unresponsive_blocking_wait_waits_real_exit() {
+        let tm = mk_tm();
+        // 注意: blocking 任务不 update 时运行期状态一直是 Pending,
+        // 不能用状态判断"任务开始执行", 这里用 flag 确认闭包已进入。
+        let entered = Arc::new(AtomicBool::new(false));
+        let e2 = entered.clone();
+        let h = tm.spawn_blocking_typed(move |_pc: ProgressUpdater<Status>, _ct| {
+            e2.store(true, Ordering::Release);
+            // 不响应 token, 200ms 后自行返回
+            std::thread::sleep(Duration::from_millis(200));
+            Ok::<Ret, Err>(1)
+        });
+        // 等闭包真正开始执行
+        assert!(
+            wait_until(|| entered.load(Ordering::Acquire), Duration::from_secs(2)).await,
+            "blocking closure should start"
+        );
+        let t0 = std::time::Instant::now();
+        h.cancel();
+        let ts = tokio::time::timeout(Duration::from_secs(3), h.wait_terminal())
+            .await
+            .expect("wait_terminal should settle after the blocking closure really exits");
+        assert!(ts.is_cancelled(), "expected Cancelled, got {ts:?}");
+        // Cancelled 必须等 blocking 闭包真正返回(约 200ms), 而不是 abort 包装后就谎报
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "Cancelled arrived too early ({:?}), blocking closure had not exited",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_observes_cancelling_or_cancelled() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|pc: ProgressUpdater<Status>, ct| async move {
+            pc.update(1); // Running
+            ct.cancelled().await;
+            Ok::<Ret, Err>(1)
+        });
+        // 等 Running 可见后, 用 wait_for 谓词等待 Cancelling/Cancelled
+        assert!(
+            wait_until(
+                || matches!(h.status(), TypedTaskState::Running(v) if *v == 1),
+                Duration::from_secs(2)
+            )
+            .await,
+            "should reach Running(1)"
+        );
+        h.cancel();
+        let ts = tokio::time::timeout(
+            Duration::from_secs(3),
+            h.wait_for(|s| s.is_cancelling() || s.is_cancelled()),
+        )
+        .await
+        .expect("wait_for should observe cancellation");
+        // Cancelling 是瞬态: 谓词可能先命中 Cancelling, 也可能直接被 terminal(Cancelled) 兜底
+        assert!(
+            ts.is_cancelling() || ts.is_cancelled(),
+            "expected Cancelling/Cancelled, got {ts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_terminal_fallback_when_predicate_never_matches() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            Ok::<Ret, Err>(5)
+        });
+        // 谓词永远 false: 任务进入终态后必须兜底返回 terminal, 而不是永久挂起
+        let ts = tokio::time::timeout(Duration::from_secs(2), h.wait_for(|_| false))
+            .await
+            .expect("terminal fallback should return");
+        assert!(ts.is_completed(), "expected Completed via terminal fallback, got {ts:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_multi_waiter_all_woken() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<Ret, Err>(11)
+        });
+        let (a, b) = tokio::join!(h.wait_terminal(), h.wait_terminal());
+        assert!(matches!(a, TypedTaskState::Completed(v) if *v == 11));
+        assert!(matches!(b, TypedTaskState::Completed(v) if *v == 11));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_on_nonexistent_task() {
+        let tm = mk_tm();
+        let ghost = TaskId::from(999_999);
+        // TaskManager 层: 任务不存在 -> None
+        let none = tokio::time::timeout(
+            Duration::from_secs(1),
+            tm.wait_terminal(ghost),
+        )
+        .await
+        .expect("must return immediately");
+        assert!(none.is_none(), "expected None for nonexistent task");
+        // Handle 层: 任务不存在 -> Invalid
+        let h = TaskHandle::<Status, Ret, Err>::new(ghost, tm);
+        assert!(h.wait_terminal().await.is_invalid());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_terminal_wrong_type_handle_is_invalid() {
+        let tm = mk_tm();
+        let h = tm.spawn_typed(|_pc: ProgressUpdater<Status>, _ct| async move {
+            Ok::<Ret, Err>(3)
+        });
+        assert!(
+            wait_until(|| h.status().is_completed(), Duration::from_secs(2)).await,
+            "task should complete"
+        );
+        // 用错误泛型构造 handle: downcast 失败 -> Invalid
+        let wrong: TaskHandle<String, String, String> = TaskHandle::new(h.id, tm.clone());
+        let ts = tokio::time::timeout(Duration::from_secs(1), wrong.wait_terminal())
+            .await
+            .expect("wrong-typed wait should return immediately");
+        assert!(ts.is_invalid(), "expected Invalid, got {ts:?}");
+    }
+
+    // ---- TypedTaskStateRef / as_typed / to_typed 转换 ----
+
+    #[test]
+    fn typed_state_ref_conversions() {
+        // owned (Arc) -> ref (借用)
+        let owned = TypedTaskState::Completed(Arc::new(42i32));
+        let r: TypedTaskStateRef<u32, i32, String> = (&owned).into();
+        assert!(matches!(r, TypedTaskStateRef::Completed(v) if *v == 42));
+        // ref -> owned (clone)
+        let back: TypedTaskState<u32, i32, String> = r.into();
+        assert!(matches!(back, TypedTaskState::Completed(v) if *v == 42));
+        // 无 payload 变体往返
+        let p: TypedTaskStateRef<u32, i32, String> = (&TypedTaskState::<u32, i32, String>::Pending).into();
+        assert!(p.is_pending());
+        let o: TypedTaskState<u32, i32, String> = TypedTaskStateRef::Panicked(&"x".to_string()).into();
+        assert!(o.is_panicked());
+        let inv_r: TypedTaskStateRef<u32, i32, String> =
+            (&TypedTaskState::<u32, i32, String>::Invalid).into();
+        assert!(inv_r.is_invalid());
+        let inv_o: TypedTaskState<u32, i32, String> = TypedTaskStateRef::Invalid.into();
+        assert!(inv_o.is_invalid());
+    }
+
+    #[test]
+    fn typed_cast_ok_and_mismatch() {
+        // as_typed: 类型匹配 -> Running(&v)
+        let s = TaskState::Running(Arc::new(7u32));
+        assert!(matches!(s.as_typed::<u32, i32, String>(), TypedTaskStateRef::Running(v) if *v == 7));
+        // as_typed: 类型不匹配 -> Invalid
+        assert!(s.as_typed::<String, i32, String>().is_invalid());
+        // to_typed: Completed downcast 失败 -> Invalid
+        let c = TaskState::Completed(Arc::new(3i32));
+        assert!(matches!(c.to_typed::<u32, String, String>(), TypedTaskState::Invalid));
+        // into_result: downcast 失败 / 非终态 -> None
+        assert!(c.into_result::<String, String>().is_none());
+        assert!(TaskState::Pending.into_result::<i32, String>().is_none());
+        // 终态类型匹配 -> Some(Ok/Err)
+        assert!(matches!(c.into_result::<i32, String>(), Some(Ok(v)) if *v == 3));
+        let f = TaskState::Failed(Arc::new("e".to_string()));
+        assert!(matches!(f.into_result::<i32, String>(), Some(Err(TaskError::Failed(e))) if e.as_str() == "e"));
+    }
 }
