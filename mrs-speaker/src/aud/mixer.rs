@@ -133,6 +133,7 @@ fn select_mixer_channel(
     if res == *trig_rx {
         match trig_rx.read_select(res) {
             Ok(MixerTriggerPayload::Read(size, mut buf, frame_tx)) => {
+                buf.resize(size, 0.0);
                 mixer_mix_tracks(size, &mut buf, tracks);
                 // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
                 frame_tx.send(buf);
@@ -219,10 +220,10 @@ impl Clone for MixerOutput {
 impl MixerOutput {
     pub fn read_frames(&mut self, data: &mut [f32], timeout: Duration) -> usize {
         let mut time_left = timeout;
-        // let mut start_at = Instant::now();
         if self.state.read_frames_errored.load(Ordering::Relaxed) {
             return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
         }
+        // 触发 Seek 操作
         let trig_at = if self.state.disconnected.load(Ordering::Acquire) {
             // 断开的时间
             let skip_at = Instant::now();
@@ -253,24 +254,27 @@ impl MixerOutput {
         } else {
             Instant::now()
         };
-        // match &self.buf {
-        //     Some(buf) => {}
-        //     None => {}
-        // }
-        let buf = Vec::new(); // todo
-        // 开销是一次box堆分配
+
+        // 为 Read 操作准备循环利用的缓冲区。清空 buf 但是不影响已分配空间。
+        self.buf.as_mut().map(|b| b.clear());
+        // 拿出 buf，如果 buf 是None就创建新的。最坏是一次 vec 堆分配。
+        let mut buf = self.buf.take().unwrap_or_default();
+        // 为存放这次 stream 请求分配额外空间。
+        buf.reserve(data.len().saturating_sub(buf.capacity()));
+
+        // 触发 Read 操作。开销是一次 box 堆分配。
         let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
         match self.trig_tx.send_timeout(
             MixerTriggerPayload::Read(data.len(), buf, frame_tx),
             time_left,
         ) {
-            Err(SendTimeoutError::Timeout(_v)) => {
-                // trig channel 积攒了一个 message，刚发的 message 被退回。
-                // 上一个 `Some(frame_tx)` 的 `frame_rx` 已被 drop，让 worker 对它发送的内容被自动 drop 所以没问题
+            Err(SendTimeoutError::Timeout(MixerTriggerPayload::Read(_, buf, _))) => {
+                self.buf = Some(buf); // channel 积压，回收 buf。
                 // 只有 read_frames 被并发调用或 mixer_worker 忙时才能触发这里。但此方法不允许并发调用。
                 return 0;
             }
-            Err(SendTimeoutError::Disconnected(_v)) => {
+            Err(SendTimeoutError::Disconnected(MixerTriggerPayload::Read(_, buf, _))) => {
+                self.buf = Some(buf); // channel 另一侧断开，回收 buf。
                 self.state
                     .read_frames_errored
                     .store(true, Ordering::Relaxed);
@@ -281,19 +285,20 @@ impl MixerOutput {
         let recv_at = Instant::now();
         time_left = time_left.saturating_sub(recv_at.saturating_duration_since(trig_at));
         match frame_rx.recv_timeout(time_left) {
-            Ok(x) => {
-                let n = x.len().min(data.len());
-                data[..n].copy_from_slice(&x[..n]);
+            Ok(buf) => {
+                let n = buf.len().min(data.len());
+                data[..n].copy_from_slice(&buf[..n]);
+                self.buf = Some(buf); // 对面响应，回收 buf。
                 n
             }
             Err(RecvTimeoutError::Timeout) => {
-                0 // mixer_worker 响应超时
+                0 // mixer_worker 响应超时。buf 会在下次调用时重新创建。
             }
             Err(RecvTimeoutError::Disconnected) => {
                 self.state
                     .read_frames_errored
                     .store(true, Ordering::Relaxed);
-                0 // mixer 死了
+                0 // mixer 死了。buf 会在下次恢复时重新创建。
             }
         }
     }
