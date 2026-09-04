@@ -737,7 +737,7 @@ pub struct Clip {
     /// true = 只在从 Track 队列取出时跳过播放这个 Clip
     timeout: Arc<AtomicBool>,
     /// Clip 播放完 drop 信号
-    _done_tx: crossfire::null::CloseHandle<crossfire::mpsc::Null>,
+    _done_tx: crossfire::null::CloseHandle<crossfire::mpmc::Null>,
 }
 
 impl Clip {
@@ -745,9 +745,9 @@ impl Clip {
         let skip: Arc<AtomicBool> = Default::default();
         let timeout: Arc<AtomicBool> = Default::default();
         let (done_tx, done_rx): (
-            crossfire::null::CloseHandle<crossfire::mpsc::Null>,
-            crossfire::AsyncRx<crossfire::mpsc::Null>,
-        ) = crossfire::mpsc::Null::new().new_async();
+            crossfire::null::CloseHandle<crossfire::mpmc::Null>,
+            crossfire::MAsyncRx<crossfire::mpmc::Null>,
+        ) = crossfire::mpmc::Null::new().new_async();
         (
             Self {
                 sample,
@@ -794,7 +794,7 @@ impl Clip {
 pub struct ClipHandle {
     skip: Arc<AtomicBool>,
     timeout: Arc<AtomicBool>,
-    done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
+    done_rx: crossfire::MAsyncRx<crossfire::mpmc::Null>,
 }
 
 impl ClipHandle {
@@ -812,6 +812,11 @@ impl ClipHandle {
     pub async fn done(&self) {
         let _ = self.done_rx.recv().await;
     }
+
+    /// 克隆一份完成通知接收端。
+    pub fn done_rx(&self) -> crossfire::MAsyncRx<crossfire::mpmc::Null> {
+        self.done_rx.clone()
+    }
 }
 
 pub struct ClipGroup {
@@ -823,7 +828,7 @@ pub struct ClipGroup {
     pos: usize,
     skip: Arc<AtomicBool>,
     timeout: Arc<AtomicBool>,
-    _done_tx: crossfire::null::CloseHandle<crossfire::mpsc::Null>,
+    _done_tx: crossfire::null::CloseHandle<crossfire::mpmc::Null>,
 }
 
 impl ClipGroup {
@@ -832,9 +837,9 @@ impl ClipGroup {
         let skip: Arc<AtomicBool> = Default::default();
         let timeout: Arc<AtomicBool> = Default::default();
         let (done_tx, done_rx): (
-            crossfire::null::CloseHandle<crossfire::mpsc::Null>,
-            crossfire::AsyncRx<crossfire::mpsc::Null>,
-        ) = crossfire::mpsc::Null::new().new_async();
+            crossfire::null::CloseHandle<crossfire::mpmc::Null>,
+            crossfire::MAsyncRx<crossfire::mpmc::Null>,
+        ) = crossfire::mpmc::Null::new().new_async();
         (
             Self {
                 clips: clips.into(),
@@ -930,7 +935,7 @@ impl ClipGroup {
 pub struct ClipGroupHandle {
     skip: Arc<AtomicBool>,
     timeout: Arc<AtomicBool>,
-    done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
+    done_rx: crossfire::MAsyncRx<crossfire::mpmc::Null>,
 }
 
 impl ClipGroupHandle {
@@ -947,6 +952,11 @@ impl ClipGroupHandle {
     /// 等待这个 ClipGroup 的生命周期结束。
     pub async fn done(&self) {
         let _ = self.done_rx.recv().await;
+    }
+
+    /// 克隆一份完成通知接收端。
+    pub fn done_rx(&self) -> crossfire::MAsyncRx<crossfire::mpmc::Null> {
+        self.done_rx.clone()
     }
 }
 
@@ -1127,5 +1137,78 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), gh.done())
             .await
             .expect("group done must fire");
+    }
+
+    /// mpmc done：多组并发 join（JoinSet 场景，模拟真机测试的多设备 join）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_multiple_groups_with_joinset() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-joinset");
+
+        const N: usize = 4;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..N {
+            let (clip, _ch) = Clip::new(vec![0.25f32; 960 * 2]);
+            let (group, gh) = ClipGroup::new(vec![clip]);
+            let (track, th) = Track::new();
+            th.push_clip_group(group).await.unwrap();
+            handle.add_tracks(vec![track]).unwrap();
+            // move 进独立 task join（正是真机测试的写法）
+            set.spawn(async move { gh.done().await });
+        }
+
+        // 消费内容：N 组各 2 帧
+        let mut buf = vec![0.0f32; 960];
+        for _ in 0..N * 2 {
+            assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        }
+
+        // 全部 done 都应触发
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(res) = set.join_next().await {
+                res.expect("join task must not panic");
+            }
+        })
+        .await
+        .expect("all groups must complete");
+    }
+
+    /// clone done_rx：handle 保留控制权（还能 skip），rx 交给他处 join
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_done_rx_keeps_handle() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-clone-rx");
+
+        let (clip, _ch) = Clip::new(vec![0.25f32; 960 * 10]);
+        let (group, gh) = ClipGroup::new(vec![clip]);
+        let rx1 = gh.done_rx();
+        let rx2 = gh.done_rx();
+        let (track, th) = Track::new();
+        th.push_clip_group(group).await.unwrap();
+        handle.add_tracks(vec![track]).unwrap();
+
+        // 两个独立消费者各自等 done，handle 仍留在本测试里
+        let j1 = tokio::spawn(async move { rx1.recv().await });
+        let j2 = tokio::spawn(async move { rx2.recv().await });
+
+        // 播 2 帧后整组 skip
+        let mut buf = vec![0.0f32; 960];
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        gh.skip();
+        // 下一帧驱动 skip 生效（组清空并结束）
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+
+        // 两个消费者都应收到完成通知
+        tokio::time::timeout(Duration::from_secs(1), j1)
+            .await
+            .expect("consumer 1 timeout")
+            .expect("consumer 1 recv");
+        tokio::time::timeout(Duration::from_secs(1), j2)
+            .await
+            .expect("consumer 2 timeout")
+            .expect("consumer 2 recv");
+        // handle 仍可用：组结束后 done() 立即返回
+        tokio::time::timeout(Duration::from_secs(1), gh.done())
+            .await
+            .expect("gh done must return");
     }
 }

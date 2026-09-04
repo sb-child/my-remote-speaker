@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use mrs_speaker::aud::{
     self,
     handler::host_handler,
-    mixer::{Clip, ClipGroup, MixerHandle, Mixers, Track},
+    mixer::{Clip, ClipGroup, ClipGroupHandle, MixerHandle, Mixers, Track},
 };
 use my_remote_speaker::task::TaskManager;
 use std::{ops::Index, sync::Arc, time::Duration};
@@ -121,34 +121,51 @@ async fn audio_test(
         .flatten()
         .collect();
     info!("got {} devices.", devs.len());
-    let tracks = Vec::new();
-    let track_handles = Vec::new();
+    let mut tracks: Vec<Track> = Vec::new();
+    let mut track_handles: Vec<ClipGroupHandle> = Vec::new();
     for _ in 0..devs.len() {
         info!("create tracks.");
         let (track, th) = Track::new();
-        let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
-        let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
+        let (clip_left, _clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
+        let (clip_right, _crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
         let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
         th.push_clip_group(clipgroup).await?;
         tracks.push(track);
-        track_handles.push((th, clh, crh, cgh));
+        track_handles.push(cgh);
     }
+
     info!("resume streams.");
+    let mut set = JoinSet::new();
     for d in &devs {
-        d.resume().map_err(|e| format!("{:?}", e))?;
+        let d = d.clone();
+        set.spawn_blocking(move || d.resume().map_err(|e| format!("{:?}", e)));
     }
+    while let Some(res) = set.join_next().await {
+        res??;
+    }
+
     info!("play tracks.");
-    for d in &devs {
-        let t = tracks.pop().ok_or("no track left.")?;
-        let track = d.add_tracks(vec![t]).map_err(|e| format!("{:?}", e))?;
-        let track_id = track.get(0).ok_or("no track id.")?;
+    let mut set = JoinSet::new();
+    for (d, track) in devs.iter().zip(tracks) {
+        let d = d.clone();
+        set.spawn_blocking(move || {
+            let ids = d.add_tracks(vec![track]).map_err(|e| format!("{:?}", e))?;
+            ids.get(0).ok_or("no track id.")?;
+            Ok::<(), String>(())
+        });
     }
+    while let Some(res) = set.join_next().await {
+        res??;
+    }
+
     info!("wait complete.");
-    let set = JoinSet::new();
-    for (_, _, _, cgh) in track_handles {
+    let mut set = JoinSet::new();
+    for cgh in track_handles {
         set.spawn(async move { cgh.done().await });
     }
-    set.join_all().await;
+    while let Some(res) = set.join_next().await {
+        res?;
+    }
 
     info!("test done.");
     tokio::time::sleep(Duration::from_secs(10)).await;
