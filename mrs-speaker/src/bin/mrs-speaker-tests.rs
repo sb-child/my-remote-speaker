@@ -119,7 +119,7 @@ async fn audio_test(
         let (track, th) = Track::new();
         let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
         let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
-        let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
+        let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]); // 1s left then 1s right
         th.push_clip_group(clipgroup).await?;
 
         info!("resume stream.");
@@ -155,7 +155,7 @@ async fn audio_test(
         let (track, th) = Track::new();
         let (clip_left, _clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
         let (clip_right, _crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
-        let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
+        let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]); // 1s left then 1s right
         th.push_clip_group(clipgroup).await?;
         tracks.push(track);
         track_handles.push(cgh);
