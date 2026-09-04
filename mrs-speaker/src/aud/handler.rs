@@ -9,7 +9,7 @@ use cpal::{
 };
 use crossfire::{RecvError, RecvTimeoutError, select::Select};
 use my_remote_speaker::{
-    task::{TaskHandle, TaskManager, TypedTaskState},
+    task::{ProgressUpdater, TaskHandle, TaskManager, TypedTaskState},
     util::IteratorExt as _,
 };
 use snafu::prelude::*;
@@ -37,9 +37,8 @@ fn on_device_add(
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, desc.as_ref());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
-    let h = tm.spawn_blocking_typed(move |_tm, tc, ct| {
-        tc.update(()); // todo
-        device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
+    let h = tm.spawn_blocking_typed(move |_tm, pu, ct| {
+        device_handler(&dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
     });
     h.cancel_at(&ct);
     if let Some(old_task) = dh.insert(dev_id, h) {
@@ -91,9 +90,8 @@ fn on_device_online(
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, description.as_ref());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
-    let h = tm.spawn_blocking_typed(move |_tm, tc, ct| {
-        tc.update(()); // todo
-        device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
+    let h = tm.spawn_blocking_typed(move |_tm, pu, ct| {
+        device_handler(&dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
     });
     h.cancel_at(&ct);
     if let Some(old_task) = dh.insert(dev_id, h) {
@@ -166,7 +164,12 @@ fn get_device_status(
     }
 }
 
-pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken) {
+pub fn host_handler(
+    tm: TaskManager,
+    pu: ProgressUpdater<()>,
+    ct: CancellationToken,
+    mixers: Arc<Mixers>,
+) {
     let audio_host = cpal::default_host();
     enum Action {
         OnDeviceAdd(Option<cpal::DeviceDescription>),
@@ -245,6 +248,7 @@ pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken)
         } else {
             thread::sleep(Duration::from_secs(1));
         }
+        pu.update(()); // devices are inited
     }
 }
 
@@ -252,9 +256,10 @@ pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken)
 fn device_handler(
     _dev_id: &str,
     dev_id: &cpal::DeviceId,
-    ct: CancellationToken,
     mixer_ctrl: MixerController,
     mixer_out: MixerOutput,
+    pu: ProgressUpdater<()>,
+    ct: CancellationToken,
 ) -> Result<(), DeviceHandlerError> {
     info!("Init device...");
     let audio_host = cpal::default_host();
@@ -307,6 +312,7 @@ fn device_handler(
         support_f32,
         mixer_ctrl,
         mixer_out,
+        pu,
         ct,
     )
     .context(StreamSnafu)?;
@@ -323,6 +329,7 @@ fn stream_handler(
     support_f32: bool,
     mixer_ctrl: MixerController,
     mixer_out: MixerOutput,
+    pu: ProgressUpdater<()>,
     ct: CancellationToken,
 ) -> Result<(), StreamHandlerError> {
     let (restart_tx, restart_rx) = crossfire::mpsc::bounded_blocking(16);
@@ -395,6 +402,7 @@ fn stream_handler(
             return Err(StreamHandlerError::OtherDeviceError { source: e });
         }
         info!("Stream started, waiting for events.");
+        pu.update(()); // device is inited
         loop {
             match stream_handle_event(&mut sel, &restart_rx, &events_rx, &ct) {
                 StreamAction::Exit => return Ok(()),

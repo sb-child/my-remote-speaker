@@ -3,7 +3,10 @@ pub mod mixer;
 pub mod scheduler;
 
 use my_remote_speaker::task::TaskManager;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
+
+use crate::aud::{handler::host_handler, mixer::Mixers};
 
 /// Sample Rate = 48000 Hz
 pub const SAMPLE_RATE: u32 = 48000;
@@ -29,7 +32,15 @@ const LIMITER_RELEASE: f32 = 0.15;
 pub struct AudioManager {}
 
 impl AudioManager {
-    pub fn new(_tm: TaskManager) -> Self {
+    pub async fn new(tm: TaskManager, ct: CancellationToken) -> Self {
+        let mixers = Arc::new(Mixers::new(tm.clone(), ct.clone()));
+        let mixers_for_host_handler = mixers.clone();
+        let h = tm.spawn_blocking_typed(move |tm, pu, ct| {
+            host_handler(tm, pu, ct, mixers_for_host_handler);
+            Ok::<(), ()>(())
+        });
+        h.cancel_at(&ct);
+        h.wait_for(|s| s.is_running()).await;
         Self {}
     }
 }
