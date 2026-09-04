@@ -1,6 +1,5 @@
 use crate::aud::{
     SAMPLE_RATE,
-    dcblocker::DcBlocker,
     mixer::{DeviceInfo, MixerController, MixerEvent, MixerEventRx, MixerOutput, Mixers},
 };
 use cpal::{
@@ -342,7 +341,6 @@ fn stream_handler(
         let mut mo_for_stream_cb = mixer_out.clone();
         let restart_tx_cb = restart_tx.clone();
         let mut temp_buf: Vec<f32> = vec![];
-        let (mut dc_blocker, dc_blocker_handle) = DcBlocker::default_48k();
         let stream_res = if support_f32 {
             device.build_output_stream(
                 stream_config,
@@ -351,7 +349,6 @@ fn stream_handler(
                         data,
                         cbi,
                         &mut temp_buf,
-                        &mut dc_blocker,
                         support_2ch,
                         &mut mo_for_stream_cb,
                     );
@@ -367,7 +364,6 @@ fn stream_handler(
                         data,
                         cbi,
                         &mut temp_buf,
-                        &mut dc_blocker,
                         support_2ch,
                         &mut mo_for_stream_cb,
                     );
@@ -407,7 +403,6 @@ fn stream_handler(
                     return Err(StreamHandlerError::DeviceDisconnected { source });
                 }
                 StreamAction::Play => {
-                    dc_blocker_handle.reset();
                     if let Err(e) = stream.play() {
                         return Err(StreamHandlerError::OtherDeviceError { source: e });
                     }
@@ -416,7 +411,6 @@ fn stream_handler(
                     if let Err(e) = stream.pause() {
                         return Err(StreamHandlerError::OtherDeviceError { source: e });
                     }
-                    dc_blocker_handle.reset();
                 }
                 StreamAction::Ignore => {}
             }
@@ -506,17 +500,16 @@ fn stream_callback_convertor_f32(
     data: &mut [f32],
     cbi: &OutputCallbackInfo,
     temp_buf: &mut Vec<f32>,
-    dc_blocker: &mut DcBlocker,
     support_2ch: bool,
     mixer_out: &mut MixerOutput,
 ) -> () {
     if support_2ch {
         // build_output_stream docs: The slice is pre-filled with silence.
-        stream_callback_handler(data, cbi, dc_blocker, mixer_out);
+        stream_callback_handler(data, cbi, mixer_out);
     } else {
         let target_2ch_len = data.len() * 2;
         temp_buf.resize(target_2ch_len, 0.0);
-        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, dc_blocker, mixer_out);
+        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, mixer_out);
         for (i, frame) in temp_buf.chunks_exact(2).enumerate() {
             data[i] = (frame[0] + frame[1]) * 0.5;
         }
@@ -527,21 +520,20 @@ fn stream_callback_convertor_i16(
     data: &mut [i16],
     cbi: &OutputCallbackInfo,
     temp_buf: &mut Vec<f32>,
-    dc_blocker: &mut DcBlocker,
     support_2ch: bool,
     mixer_out: &mut MixerOutput,
 ) -> () {
     if support_2ch {
         let target_len = data.len();
         temp_buf.resize(target_len, 0.0);
-        stream_callback_handler(&mut temp_buf[..target_len], cbi, dc_blocker, mixer_out);
+        stream_callback_handler(&mut temp_buf[..target_len], cbi, mixer_out);
         for (out_sample, &in_sample) in data.iter_mut().zip(temp_buf.iter()) {
             *out_sample = f32_to_i16(in_sample);
         }
     } else {
         let target_2ch_len = data.len() * 2;
         temp_buf.resize(target_2ch_len, 0.0);
-        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, dc_blocker, mixer_out);
+        stream_callback_handler(&mut temp_buf[..target_2ch_len], cbi, mixer_out);
         for (i, frame) in temp_buf.chunks_exact(2).enumerate() {
             let mono_f32 = (frame[0] + frame[1]) * 0.5;
             data[i] = f32_to_i16(mono_f32);
@@ -552,16 +544,12 @@ fn stream_callback_convertor_i16(
 /// f32, 2ch
 fn stream_callback_handler(
     data: &mut [f32],
-    cbi: &OutputCallbackInfo,
-    dc_blocker: &mut DcBlocker,
+    _cbi: &OutputCallbackInfo,
     mixer_out: &mut MixerOutput,
 ) {
-    // read frames from mixer
-    let t = cbi.timestamp();
-    let read_timeout = t.playback.duration_since(t.callback);
-    mixer_out.read_frames(data, read_timeout);
-    // last, pass the dc blocker
-    dc_blocker.process_interleaved(data);
+    // let t = cbi.timestamp();
+    // let read_timeout = t.playback.duration_since(t.callback);
+    mixer_out.read_frames(data);
 }
 
 #[derive(Snafu, Debug)]

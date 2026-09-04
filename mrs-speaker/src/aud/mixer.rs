@@ -1,27 +1,27 @@
-use crate::aud::SAMPLE_RATE;
-use crossfire::{
-    BlockingRxTrait, BlockingTxTrait, RecvError, RecvTimeoutError, SendTimeoutError, select::Select,
+use crate::aud::{
+    GROUP_CAP, IDLE_LEVEL, L2_CAP, LIMITER_ATTACK, LIMITER_RELEASE, MAX_RENDER_SKIP_FRAMES,
+    SAMPLE_RATE, STANDBY_DELAY,
 };
+use crossfire::{BlockingTxTrait, RecvTimeoutError, select::Select};
 use dashmap::DashMap;
+use fundsp::prelude::*;
 use my_remote_speaker::{
     task::{TaskHandle, TaskManager},
-    use_id,
     util::AtomicInstant,
 };
 use std::{
-    collections::{HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
+use thiserror::Error;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{error, info};
+use tracing::{info, warn};
 
-/// 混音器管理器
-///
-/// 为每个设备分配一个 Mixer。
+/// 混音器 registry
+/// - 为每设备分配一个 Mixer。
 pub struct Mixers {
     tm: TaskManager,
     ct: CancellationToken,
@@ -58,14 +58,17 @@ impl Mixers {
         }
     }
 
-    /// 取设备的 mixer，不存在则创建
-    pub fn get_or_create(&self, info: &DeviceInfo) -> (MixerHandle, MixerController, MixerOutput) {
+    /// 取设备的 mixer，不存在则创建。
+    pub(crate) fn get_or_create(
+        &self,
+        info: &DeviceInfo,
+    ) -> (MixerHandle, MixerController, MixerOutput) {
         if self
             .inner
             .remove_if(&info.id, |_, v| worker_panicked(v))
             .is_some()
         {
-            error!(dev = %info.id, "mixer worker panicked. dropping and recreating.");
+            warn!(dev = %info.id, "mixer worker panicked. dropping and recreating.");
         }
         if let Some(b) = self.inner.get(&info.id) {
             return (b.handle.clone(), b.ctrl.clone(), b.out.clone());
@@ -85,19 +88,19 @@ impl Mixers {
         ret
     }
 
-    /// 移除指定设备的 Mixer
-    pub fn remove(&self, dev_id: &str) {
+    /// 移除指定设备的 Mixer。
+    pub(crate) fn remove(&self, dev_id: &str) {
         if self.inner.remove(dev_id).is_some() {
             info!(dev = %dev_id, "mixer removed");
         }
     }
 
-    /// 获取指定设备的 MixerHandle
+    /// 获取指定设备的 MixerHandle。
     pub fn handle(&self, dev_id: &str) -> Option<MixerHandle> {
         self.inner.get(dev_id).map(|b| b.handle.clone())
     }
 
-    /// 枚举当前的设备
+    /// 枚举当前的设备。
     pub fn devices(&self) -> Vec<DeviceInfo> {
         self.inner.iter().map(|b| b.meta.clone()).collect()
     }
@@ -109,10 +112,6 @@ fn worker_panicked(b: &MixerBundle) -> bool {
         .as_ref()
         .map_or(false, |w| w.status().is_panicked())
 }
-
-use_id!(Track);
-
-type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
 
 /// mixer 到 device 的控制事件
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,7 +128,7 @@ pub type MixerEventRx = crossfire::MRx<crossfire::mpmc::Array<MixerEvent>>;
 /// 空闲待机模式
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandbyMode {
-    /// 默认所有轨道空闲`STANDBY_DELAY`时暂停 stream，在轨道有内容时恢复。
+    /// 默认：输出空闲（低电平）`STANDBY_DELAY` 后请求暂停 stream，有内容时由调用方 resume。
     Auto,
     /// 强制 stream 一直保持运行
     ForcePlay,
@@ -141,35 +140,111 @@ impl Default for StandbyMode {
     }
 }
 
-/// 空闲请求待机延迟
-const STANDBY_DELAY: Duration = Duration::from_secs(2);
-
-/// mixer worker 的空闲/待机状态机
-#[derive(Default)]
-struct StandbyState {
-    mode: StandbyMode,
-    /// 连续空闲的开始时刻
-    idle_since: Option<Instant>,
-    /// 已触发过待机请求
-    fired: bool,
+/// master 输出链
+/// - 输入 -> DC blocker -> look-ahead limiter -> 输出。
+fn master_chain() -> Box<dyn AudioUnit> {
+    Box::new(
+        (dcblock::<f32>() | dcblock::<f32>()) >> limiter_stereo(LIMITER_ATTACK, LIMITER_RELEASE),
+    )
 }
 
+/// 求和层
+/// - 输入 cap 组立体声输入信号（cap * 2 个通道）-> 逐通道累加合并 -> 输出 1 组立体声信号（2 个通道）
+#[derive(Clone)]
+struct SumLevel {
+    pairs: usize,
+}
+
+impl AudioUnit for SumLevel {
+    fn tick(&mut self, input: &[f32], output: &mut [f32]) {
+        output[0] = 0.0; // 左声道输出采样点
+        output[1] = 0.0; // 右声道输出采样点
+        for i in 0..self.pairs {
+            output[0] += input[i * 2]; // 左声道累加
+            output[1] += input[i * 2 + 1]; // 右声道累加
+        }
+    }
+
+    fn process(&mut self, size: usize, input: &BufferRef, output: &mut BufferMut) {
+        debug_assert_eq!(input.channels(), self.pairs * 2);
+        debug_assert!(size <= MAX_BUFFER_SIZE);
+        for s in 0..size {
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            for c in 0..self.pairs {
+                l += input.channel_f32(c * 2)[s]; // 累加采样点 s 处的左声道
+                r += input.channel_f32(c * 2 + 1)[s]; // 累加采样点 s 处的右声道
+            }
+            output.channel_f32_mut(0)[s] = l;
+            output.channel_f32_mut(1)[s] = r;
+        }
+    }
+
+    fn inputs(&self) -> usize {
+        self.pairs * 2
+    }
+
+    fn outputs(&self) -> usize {
+        2
+    }
+
+    fn route(&mut self, _input: &SignalFrame, _frequency: f64) -> SignalFrame {
+        SignalFrame::new(2)
+    }
+
+    fn get_id(&self) -> u64 {
+        // "MRSS": Multi-Route Stereo Summer
+        0x4d52_5353
+    }
+
+    fn footprint(&self) -> usize {
+        0
+    }
+}
+
+type OneshotTx<T> = crossfire::oneshot::TxOneshot<T>;
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, Default)]
+pub struct TrackId(NodeId);
+
+impl From<NodeId> for TrackId {
+    fn from(value: NodeId) -> Self {
+        Self(value)
+    }
+}
+
+impl Into<NodeId> for TrackId {
+    fn into(self) -> NodeId {
+        self.0
+    }
+}
+
+/// attach 校验错误
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum AttachError {
+    #[error("Track 必须是生成器(0 输入)，实际 {inputs} 输入")]
+    NotGenerator { inputs: usize },
+    #[error("Track 必须输出 2 声道，实际 {outputs} 声道")]
+    NotStereo { outputs: usize },
+    #[error("Mixer 的 sum 树已满(上限 {cap} Track)")]
+    NoSlot { cap: usize },
+}
+
+/// mixer worker 命令
 pub enum MixerCmd {
-    AddTracks(Vec<Track>, OneshotTx<Vec<TrackId>>),
-    RemoveTrack(Vec<TrackId>, OneshotTx<Vec<bool>>),
+    Attach {
+        unit: Box<dyn AudioUnit>,
+        tx: OneshotTx<Result<TrackId, AttachError>>,
+    },
+    Detach {
+        id: TrackId,
+        tx: OneshotTx<bool>,
+    },
     SetStandbyMode(StandbyMode, OneshotTx<()>),
     Resume((), OneshotTx<()>),
 }
 
 type MixerCmdTx = crossfire::MTx<crossfire::mpmc::Array<MixerCmd>>;
 type MixerCmdRx = crossfire::MRx<crossfire::mpmc::Array<MixerCmd>>;
-
-enum MixerTriggerPayload {
-    Seek(usize),
-    Read(usize, Vec<f32>, OneshotTx<Vec<f32>>),
-}
-
-type MixerTrigRx = crossfire::MRx<crossfire::mpmc::Array<MixerTriggerPayload>>;
 
 struct MixerBundle {
     mixer: Mixer,
@@ -179,9 +254,7 @@ struct MixerBundle {
     meta: DeviceInfo,
 }
 
-/// 混音器
-///
-/// 可以挂载多个轨道，合并为一个输出。
+/// 混音器宿主（每设备一个）
 pub struct Mixer {
     worker: Option<TaskHandle<(), (), ()>>,
     _ct_guard: DropGuard,
@@ -193,24 +266,30 @@ impl Mixer {
         ct: &CancellationToken,
     ) -> (Self, MixerHandle, MixerController, MixerOutput) {
         let mixer_ct = ct.child_token();
-        let (trig_tx, trig_rx) = crossfire::mpmc::bounded_blocking(1);
         let (cmd_tx, cmd_rx) = crossfire::mpmc::bounded_blocking(16);
         let (events_tx, events_rx) = crossfire::mpmc::bounded_blocking(16);
+        let (backend_tx, backend_rx) = crossfire::oneshot::oneshot();
+        let state = Arc::new(MixerLinkState {
+            backend_errored: Default::default(),
+            disconnected: Default::default(),
+            disconnect_at: AtomicInstant::new(Instant::now()),
+            mode: Mutex::new(StandbyMode::Auto),
+            events_tx: events_tx.clone(),
+            events_rx: events_rx.clone(),
+        });
         let worker = spawn_mixer_worker(
             tm,
-            trig_rx.clone(),
             cmd_rx.clone(),
-            events_tx.clone(),
+            events_tx,
+            state.clone(),
+            backend_tx,
             &mixer_ct,
         );
         let ct_guard = mixer_ct.drop_guard();
-        let state = Arc::new(MixerLinkState {
-            read_frames_errored: Default::default(),
-            disconnected: Default::default(),
-            disconnect_at: AtomicInstant::new(Instant::now()),
-            _events_tx: events_tx,
-            events_rx,
-        });
+        // 等 worker 建好 network backend。
+        let backend = backend_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mixer worker failed to initialize network within 5s");
         (
             Self {
                 worker: Some(worker),
@@ -221,9 +300,10 @@ impl Mixer {
                 state: state.clone(),
             },
             MixerOutput {
-                trig_tx,
-                buf: None,
+                backend: Arc::new(Mutex::new(backend)),
                 state,
+                idle_since: None,
+                standby_fired: false,
             },
         )
     }
@@ -231,200 +311,191 @@ impl Mixer {
 
 fn spawn_mixer_worker(
     tm: &TaskManager,
-    trig_rx: MixerTrigRx,
     cmd_rx: MixerCmdRx,
     events_tx: MixerEventTx,
+    state: Arc<MixerLinkState>,
+    backend_tx: OneshotTx<NetBackend>,
     ct: &CancellationToken,
 ) -> TaskHandle<(), (), ()> {
     let h = tm.spawn_blocking_typed(move |_tm, pc, ct| {
         pc.update(());
-        mixer_worker(trig_rx, cmd_rx, events_tx, ct);
+        mixer_worker(cmd_rx, events_tx, state, backend_tx, ct);
         Ok(())
     });
     h.cancel_at(ct);
     h
 }
 
+/// 一级 sum 组
+struct SumGroup {
+    node: NodeId,
+    /// 每个端口对应的 child 节点
+    slots: Vec<Option<NodeId>>,
+}
+
+/// 开一组一级 adder 并接到二级 adder 的下一个空闲口。
+fn open_group(net: &mut Net, l2: &NodeId, groups: &mut Vec<SumGroup>) {
+    let node = net.push(Box::new(SumLevel { pairs: GROUP_CAP }));
+    let idx = groups.len();
+    net.connect(node, 0, *l2, idx * 2);
+    net.connect(node, 1, *l2, idx * 2 + 1);
+    groups.push(SumGroup {
+        node,
+        slots: vec![None; GROUP_CAP],
+    });
+}
+
+/// worker 主循环
 fn mixer_worker(
-    trig_rx: MixerTrigRx,
     cmd_rx: MixerCmdRx,
     events_tx: MixerEventTx,
+    state: Arc<MixerLinkState>,
+    backend_tx: OneshotTx<NetBackend>,
     ct: CancellationToken,
 ) {
-    let mut tracks: HashMap<TrackId, Track> = HashMap::new();
-    let track_counter = TrackIdCounter::default();
-    let mut mixer_buf = Vec::new();
-    let mut standby = StandbyState::default();
+    let mut net = Net::new(0, 2);
+    let master = net.chain(master_chain());
+    let l2 = net.push(Box::new(SumLevel { pairs: L2_CAP }));
+    net.connect(l2, 0, master, 0);
+    net.connect(l2, 1, master, 1);
+    let mut groups: Vec<SumGroup> = Vec::new();
+    open_group(&mut net, &l2, &mut groups); // 第一组
+    net.set_sample_rate(SAMPLE_RATE as f64);
+    net.check();
+
+    // 把 backend 发给 MixerOutput
+    let mut backend = net.backend();
+    backend.set_sample_rate(SAMPLE_RATE as f64);
+    backend.allocate();
+    let _ = backend_tx.send(backend);
+
+    // 命令循环
     let mut sel = Select::new();
-    sel.add(&trig_rx);
     sel.add(&cmd_rx);
     loop {
+        if ct.is_cancelled() {
+            return;
+        }
         match sel.select_timeout(Duration::from_millis(50)) {
             Ok(res) => {
-                let read_happened = select_mixer_channel(
-                    &trig_rx,
-                    &cmd_rx,
-                    &mut sel,
-                    res,
-                    &mut tracks,
-                    &mut mixer_buf,
-                    &track_counter,
-                    &events_tx,
-                    &mut standby,
-                );
-                mixer_update_idle(read_happened, &tracks, &mut standby, &events_tx);
-                if ct.is_cancelled() {
-                    return;
+                if res == cmd_rx {
+                    match cmd_rx.read_select(res) {
+                        Ok(cmd) => handle_cmd(cmd, &mut net, &l2, &mut groups, &events_tx, &state),
+                        Err(_) => sel.remove(&cmd_rx),
+                    }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if ct.is_cancelled() {
-                    return;
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-/// 消费一个通道事件。返回 true 表示本次处理了一个 Read（混音完成）。
-fn select_mixer_channel(
-    trig_rx: &MixerTrigRx,
-    cmd_rx: &MixerCmdRx,
-    sel: &mut crossfire::select::Select<'_>,
-    res: crossfire::select::SelectResult,
-    tracks: &mut HashMap<TrackId, Track>,
-    mixer_buf: &mut Vec<f32>,
-    track_counter: &TrackIdCounter,
-    events_tx: &MixerEventTx,
-    standby: &mut StandbyState,
-) -> bool {
-    if res == *trig_rx {
-        match trig_rx.read_select(res) {
-            Ok(MixerTriggerPayload::Read(size, mut buf, frame_tx)) => {
-                buf.resize(size, 0.0);
-                mixer_buf.clear();
-                mixer_buf.reserve(size.saturating_sub(mixer_buf.capacity()));
-                mixer_buf.resize(size, 0.0);
-                mixer_mix_tracks(&mut buf, mixer_buf, tracks);
-                // 如果 frame_rx 被 drop，这里的 buf 就还不回去了，MixerOutput 端会创建一个新的。
-                frame_tx.send(buf);
-                return true;
-            }
-            Ok(MixerTriggerPayload::Seek(size)) => mixer_seek_tracks(size, tracks),
-            Err(RecvError) => sel.remove(trig_rx),
-        }
-    } else if res == *cmd_rx {
-        match cmd_rx.read_select(res) {
-            Ok(cmd) => mixer_handle_cmd(cmd, tracks, track_counter, events_tx, standby),
-            Err(RecvError) => sel.remove(cmd_rx),
-        }
-    }
-    false
-}
-
-/// 累加空闲计时
-fn mixer_update_idle(
-    read_happened: bool,
-    tracks: &HashMap<TrackId, Track>,
-    st: &mut StandbyState,
-    events_tx: &MixerEventTx,
-) {
-    if !read_happened {
-        return; // 只在 Read 事件后才更新。
-    }
-    if st.mode == StandbyMode::ForcePlay {
-        st.idle_since = None;
-        st.fired = false;
-        return;
-    }
-    let now = Instant::now();
-    if tracks.values().all(Track::is_idle) {
-        let since = st.idle_since.get_or_insert(now);
-        if !st.fired && now.duration_since(*since) >= STANDBY_DELAY {
-            st.fired = true;
-            // 向 device 发送待机信号
-            let _ = events_tx.send(MixerEvent::RequestStandby);
-            info!(idle_for = ?now.duration_since(*since), "all tracks idle, requesting standby.");
-        }
-    } else {
-        st.idle_since = None;
-        st.fired = false;
-    }
-}
-
-fn mixer_mix_tracks(
-    out_buf: &mut [f32],
-    mixer_buf: &mut [f32],
-    tracks: &mut HashMap<TrackId, Track>,
-) {
-    for track in tracks.values_mut() {
-        track.read_frames(mixer_buf);
-        // todo: 这里会爆炸，要加上削波算法
-        out_buf
-            .iter_mut()
-            .zip(mixer_buf.iter())
-            .for_each(|(o, &s)| *o += s);
-    }
-}
-
-fn mixer_seek_tracks(items: usize, tracks: &mut HashMap<TrackId, Track>) {
-    tracks.values_mut().for_each(|track| {
-        let _ = track.skip_frames(items);
-    });
-}
-
-fn mixer_handle_cmd(
+fn handle_cmd(
     cmd: MixerCmd,
-    state: &mut HashMap<TrackId, Track>,
-    track_counter: &TrackIdCounter,
+    net: &mut Net,
+    l2: &NodeId,
+    groups: &mut Vec<SumGroup>,
     events_tx: &MixerEventTx,
-    standby: &mut StandbyState,
+    state: &Arc<MixerLinkState>,
 ) {
     match cmd {
-        MixerCmd::AddTracks(tracks, tx_oneshot) => {
-            tx_oneshot.send(mixer_on_add_tracks(tracks, state, track_counter))
+        MixerCmd::Attach { unit, tx } => {
+            let r = attach_child(net, l2, groups, unit);
+            tx.send(r);
         }
-        MixerCmd::RemoveTrack(track_ids, tx_oneshot) => {
-            tx_oneshot.send(mixer_on_remove_tracks(track_ids, state))
+        MixerCmd::Detach { id, tx } => {
+            let removed = detach_child(net, groups, id);
+            tx.send(removed);
         }
-        MixerCmd::SetStandbyMode(mode, tx_oneshot) => {
-            standby.mode = mode;
-            standby.idle_since = None; // 重置计时
-            standby.fired = false; // 恢复标志
-            tx_oneshot.send(());
+        MixerCmd::SetStandbyMode(mode, tx) => {
+            if let Ok(mut m) = state.mode.lock() {
+                *m = mode;
+            }
+            tx.send(());
         }
-        MixerCmd::Resume(_, tx_oneshot) => {
+        MixerCmd::Resume(_, tx) => {
             // 向 device 发送唤醒信号
             let _ = events_tx.send(MixerEvent::RequestResume);
-            tx_oneshot.send(());
+            tx.send(());
         }
-    };
+    }
 }
 
-fn mixer_on_add_tracks(
-    tracks_to_add: Vec<Track>,
-    state: &mut HashMap<TrackId, Track>,
-    track_counter: &TrackIdCounter,
-) -> Vec<TrackId> {
-    tracks_to_add
-        .into_iter()
-        .map(|t| {
-            let id = track_counter.next();
-            state.insert(id, t);
-            id
-        })
-        .collect()
+/// 找一个空槽。优先复用已有组的空口，否则开新组。
+fn find_slot(net: &mut Net, l2: &NodeId, groups: &mut Vec<SumGroup>) -> Option<(usize, usize)> {
+    for (gi, g) in groups.iter_mut().enumerate() {
+        if let Some(si) = g.slots.iter().position(Option::is_none) {
+            return Some((gi, si));
+        }
+    }
+    if groups.len() >= L2_CAP {
+        return None; // 二级口用完
+    }
+    open_group(net, l2, groups);
+    let gi = groups.len() - 1;
+    Some((gi, 0))
 }
 
-fn mixer_on_remove_tracks(
-    tracks_to_remove: Vec<TrackId>,
-    state: &mut HashMap<TrackId, Track>,
-) -> Vec<bool> {
-    tracks_to_remove
-        .iter()
-        .map(|id| state.remove(id).is_some())
-        .collect()
+/// 插入 child。
+/// - 应插入原实例。不要 clone child，会断连控制通道。
+fn attach_child(
+    net: &mut Net,
+    l2: &NodeId,
+    groups: &mut Vec<SumGroup>,
+    unit: Box<dyn AudioUnit>,
+) -> Result<TrackId, AttachError> {
+    let inputs = unit.inputs();
+    if inputs != 0 {
+        return Err(AttachError::NotGenerator { inputs });
+    }
+    let outputs = unit.outputs();
+    if outputs != 2 {
+        return Err(AttachError::NotStereo { outputs });
+    }
+    let (gi, si) = find_slot(net, l2, groups).ok_or(AttachError::NoSlot {
+        cap: GROUP_CAP * L2_CAP,
+    })?;
+    let node = net.push(unit);
+    let g = &groups[gi];
+    net.connect(node, 0, g.node, si * 2);
+    net.connect(node, 1, g.node, si * 2 + 1);
+    groups[gi].slots[si] = Some(node);
+    net.commit();
+    Ok(node.into())
+}
+
+/// 摘下 child，断开接线并释放槽位。
+fn detach_child(net: &mut Net, groups: &mut Vec<SumGroup>, id: TrackId) -> bool {
+    let mut found = false;
+    for g in groups.iter_mut() {
+        for slot in g.slots.iter_mut() {
+            if *slot == Some(id.into()) {
+                *slot = None;
+                found = true;
+            }
+        }
+    }
+    if !found {
+        return false;
+    }
+    net.remove(id.into());
+    net.commit();
+    true
+}
+
+/// MixerHandle 命令错误
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum MixerCmdError {
+    /// 命令通道积压或断开
+    #[error("command channel send failed")]
+    Send,
+    /// mixer worker 无响应
+    #[error("mixer worker timeout")]
+    Timeout,
+    /// attach 校验失败
+    #[error("attach rejected: {0}")]
+    Attach(#[from] AttachError),
 }
 
 #[derive(Clone)]
@@ -432,18 +503,9 @@ pub struct MixerHandle {
     cmd_tx: MixerCmdTx,
 }
 
-/// MixerHandle 命令错误
-#[derive(Debug, PartialEq, Eq)]
-pub enum MixerCmdError {
-    /// 命令通道积压或断开
-    Send,
-    /// mixer worker 无响应
-    Timeout,
-}
-
 impl MixerHandle {
     /// 设置空闲待机模式。
-    /// - Auto：空闲超时自动待机。
+    /// - Auto：输出空闲超时自动待机。
     /// - ForcePlay：保持播放不待机。
     pub fn set_standby_mode(&self, mode: StandbyMode) -> Result<(), MixerCmdError> {
         let (tx, rx) = crossfire::oneshot::oneshot();
@@ -455,6 +517,7 @@ impl MixerHandle {
             .map_err(|_| MixerCmdError::Timeout)
     }
 
+    /// 唤醒（已 standby 的）stream。有新内容要播时先调这个。
     pub fn resume(&self) -> Result<(), MixerCmdError> {
         let (tx, rx) = crossfire::oneshot::oneshot();
         self.cmd_tx
@@ -465,27 +528,45 @@ impl MixerHandle {
             .map_err(|_| MixerCmdError::Timeout)
     }
 
-    /// 把轨道挂上 mixer，返回每个轨道分配到的 [TrackId]。
-    ///
-    /// 建议通过 [TrackHandle::push_clip_group] / [TrackHandle::try_push_clip_group] 把内容提前推进去再挂。
-    pub fn add_tracks(&self, tracks: Vec<Track>) -> Result<Vec<TrackId>, MixerCmdError> {
+    /// 把音频源挂上 mixer。返回 [TrackId]。
+    /// - unit 必须是生成器（0 输入，2 输出）的 AudioUnit。
+    /// - 应插入原实例。不要 clone unit，会断连控制通道。
+    pub fn attach_track(&self, unit: Box<dyn AudioUnit>) -> Result<TrackId, MixerCmdError> {
         let (tx, rx) = crossfire::oneshot::oneshot();
         self.cmd_tx
-            .send_timeout(MixerCmd::AddTracks(tracks, tx), Duration::from_secs(1))
+            .send_timeout(MixerCmd::Attach { unit, tx }, Duration::from_secs(1))
             .map_err(|_| MixerCmdError::Send)?;
         rx.recv_timeout(Duration::from_secs(1))
-            .map_err(|_| MixerCmdError::Timeout)
+            .map_err(|_| MixerCmdError::Timeout)?
+            .map_err(MixerCmdError::from)
     }
 
-    /// 把轨道从 mixer 上摘下来，返回每个 id 是否实际存在并被移除。
-    pub fn remove_tracks(&self, track_ids: Vec<TrackId>) -> Result<Vec<bool>, MixerCmdError> {
+    /// 把音频源从 mixer 摘下。返回是否实际存在并被移除。
+    pub fn detach_track(&self, id: TrackId) -> Result<bool, MixerCmdError> {
         let (tx, rx) = crossfire::oneshot::oneshot();
         self.cmd_tx
-            .send_timeout(MixerCmd::RemoveTrack(track_ids, tx), Duration::from_secs(1))
+            .send_timeout(MixerCmd::Detach { id, tx }, Duration::from_secs(1))
             .map_err(|_| MixerCmdError::Send)?;
         rx.recv_timeout(Duration::from_secs(1))
             .map_err(|_| MixerCmdError::Timeout)
     }
+}
+
+/// Mixer 链路状态。
+/// - MixerOutput 和 MixerController 共享。
+struct MixerLinkState {
+    // 后端是否发生错误。
+    // - 如果发生错误，stream 会静音。
+    backend_errored: AtomicBool,
+    // stream 是否已断开连接。
+    disconnected: AtomicBool,
+    // 断开连接的时间。
+    disconnect_at: AtomicInstant,
+    /// 当前待机模式。
+    /// - worker 写，output 读。
+    mode: Mutex<StandbyMode>,
+    events_tx: MixerEventTx,
+    events_rx: MixerEventRx,
 }
 
 #[derive(Clone)]
@@ -495,12 +576,11 @@ pub struct MixerController {
 
 impl MixerController {
     pub fn reset(&self) {
-        self.state
-            .read_frames_errored
-            .store(false, Ordering::Relaxed);
+        self.state.backend_errored.store(false, Ordering::Relaxed);
     }
 
-    /// 在 stream 掉线时调用
+    /// 在 stream 掉线时调用。
+    /// - 恢复后 MixerOutput 会渲染式跳过断连时长。
     pub fn disconnected(&self) {
         if self.state.disconnected.swap(true, Ordering::Release) {
             return; // 只记录第一次断开连接时间
@@ -516,447 +596,88 @@ impl MixerController {
     }
 }
 
-/// 设计上只允许一个线程读取，不要并发读。
+/// Mixer 输出端。
+/// - 持有 mixer network 的 NetBackend，由设备 callback 逐帧驱动。
+/// - 设计上只允许一个线程读取。
+#[derive(Clone)]
 pub struct MixerOutput {
-    trig_tx: crossfire::MTx<crossfire::mpmc::Array<MixerTriggerPayload>>,
-    buf: Option<Vec<f32>>,
+    backend: Arc<Mutex<NetBackend>>,
     state: Arc<MixerLinkState>,
-}
-
-impl Clone for MixerOutput {
-    fn clone(&self) -> Self {
-        Self {
-            trig_tx: self.trig_tx.clone(),
-            buf: None,
-            state: self.state.clone(),
-        }
-    }
+    /// 空闲计时（读线程独占；clone 后重新计时，无碍）
+    idle_since: Option<Instant>,
+    standby_fired: bool,
 }
 
 impl MixerOutput {
-    pub fn read_frames(&mut self, data: &mut [f32], timeout: Duration) -> usize {
-        let mut time_left = timeout;
-        if self.state.read_frames_errored.load(Ordering::Relaxed) {
-            return 0; // 如果出现错误说明要么 mixer 死了，要么并发读。
+    /// 读一帧输出
+    /// - 2ch interleaved f32。
+    /// - `data.len()` 必须是偶数。
+    pub fn read_frames(&mut self, data: &mut [f32]) -> usize {
+        if data.len() % 2 != 0 || data.is_empty() {
+            return 0;
         }
-        // 触发 Seek 操作
-        let trig_at = if self.state.disconnected.load(Ordering::Acquire) {
-            // 断开的时间
-            let skip_at = Instant::now();
-            let dur = skip_at.duration_since(self.state.disconnect_at.load(Ordering::Acquire));
-            // 2 channel * 48000 Hz * seconds
-            let skip_items = 2 * (dur.as_secs_f32() * SAMPLE_RATE as f32) as usize;
-            // 快进 buffer
-            match self
-                .trig_tx
-                .send_timeout(MixerTriggerPayload::Seek(skip_items), time_left)
-            {
-                Err(SendTimeoutError::Timeout(_v)) => {
-                    // trig channel 积攒了一个 message，刚发的 message 被退回。
-                    // 只有 read_frames 被并发调用或 mixer_worker 忙时才能触发这里。但此方法不允许并发调用。
-                    return 0;
-                }
-                Err(SendTimeoutError::Disconnected(_v)) => {
-                    self.state
-                        .read_frames_errored
-                        .store(true, Ordering::Relaxed);
-                    return 0;
-                }
-                _ => self.state.disconnected.store(false, Ordering::Release),
-            }
-            let trig_at = Instant::now();
-            time_left = time_left.saturating_sub(trig_at.saturating_duration_since(skip_at));
-            trig_at
-        } else {
-            Instant::now()
-        };
-
-        // 为 Read 操作准备循环利用的缓冲区。清空 buf 但是不影响已分配空间。
-        self.buf.as_mut().map(|b| b.clear());
-        // 拿出 buf，如果 buf 是None就创建新的。最坏是一次 vec 堆分配。
-        let mut buf = self.buf.take().unwrap_or_default();
-        // 为存放这次 stream 请求分配额外空间。
-        buf.reserve(data.len().saturating_sub(buf.capacity()));
-
-        // 触发 Read 操作。开销是一次 box 堆分配。
-        let (frame_tx, frame_rx) = crossfire::oneshot::oneshot();
-        match self.trig_tx.send_timeout(
-            MixerTriggerPayload::Read(data.len(), buf, frame_tx),
-            time_left,
-        ) {
-            Err(SendTimeoutError::Timeout(MixerTriggerPayload::Read(_, buf, _))) => {
-                self.buf = Some(buf); // channel 积压，回收 buf。
-                // 只有 read_frames 被并发调用或 mixer_worker 忙时才能触发这里。但此方法不允许并发调用。
+        if self.state.backend_errored.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut backend = match self.backend.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                self.state.backend_errored.store(true, Ordering::Relaxed);
                 return 0;
             }
-            Err(SendTimeoutError::Disconnected(MixerTriggerPayload::Read(_, buf, _))) => {
-                self.buf = Some(buf); // channel 另一侧断开，回收 buf。
-                self.state
-                    .read_frames_errored
-                    .store(true, Ordering::Relaxed);
-                return 0; // mixer 死了
-            }
-            _ => (),
-        }
-        let recv_at = Instant::now();
-        time_left = time_left.saturating_sub(recv_at.saturating_duration_since(trig_at));
-        match frame_rx.recv_timeout(time_left) {
-            Ok(buf) => {
-                let n = buf.len().min(data.len());
-                data[..n].copy_from_slice(&buf[..n]);
-                self.buf = Some(buf); // 对面响应，回收 buf。
-                n
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                0 // mixer_worker 响应超时。buf 会在下次调用时重新创建。
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.state
-                    .read_frames_errored
-                    .store(true, Ordering::Relaxed);
-                0 // mixer 死了。buf 会在下次恢复时重新创建。
-            }
-        }
-    }
-}
+        };
 
-struct MixerLinkState {
-    read_frames_errored: AtomicBool,
-    disconnected: AtomicBool,
-    disconnect_at: AtomicInstant,
-    /// unused
-    _events_tx: MixerEventTx,
-    events_rx: MixerEventRx,
-}
-
-/// 音频轨道
-///
-/// 可以放置多个不重叠的片段。
-pub struct Track {
-    current_clip: Option<(ClipGroup, usize)>,
-    clip_queue_rx: crossfire::Rx<crossfire::mpsc::Array<ClipGroup>>,
-}
-
-impl Track {
-    pub fn new() -> (Self, TrackHandle) {
-        let current_clip = None;
-        let (clip_queue_tx, clip_queue_rx) = crossfire::mpsc::bounded_async_blocking(128);
-        (
-            Self {
-                current_clip,
-                clip_queue_rx,
-            },
-            TrackHandle { clip_queue_tx },
-        )
-    }
-
-    pub fn skip_frames(&mut self, items: usize) -> usize {
-        let mut remaining = items;
-        while remaining > 0 {
-            if self.current_clip.is_none() && !self.try_fetch_next_clip() {
-                break;
-            }
-            if let Some((clip, pos)) = self.current_clip.as_mut() {
-                let n = clip.skip_items(remaining);
-                *pos += n;
-                remaining -= n;
-                if n == 0 {
-                    self.current_clip = None;
+        // 断连追赶
+        if self.state.disconnected.swap(false, Ordering::Acquire) {
+            let gap =
+                Instant::now().duration_since(self.state.disconnect_at.load(Ordering::Acquire));
+            let frames = (gap.as_secs_f64() * SAMPLE_RATE as f64) as usize;
+            let frames = if frames > MAX_RENDER_SKIP_FRAMES {
+                MAX_RENDER_SKIP_FRAMES
+            } else {
+                frames
+            };
+            if frames > 0 {
+                warn!(frames, "rendering skip after disconnect");
+                let mut scratch = [0.0f32; 2];
+                for _ in 0..frames {
+                    backend.tick(&[], &mut scratch);
                 }
             }
         }
-        items - remaining
-    }
 
-    /// 读取音频轨道，填满 data。内容不足的部分补 0。
-    pub fn read_frames(&mut self, data: &mut [f32]) {
-        let mut written = 0;
-        while written < data.len() {
-            if self.current_clip.is_none() && !self.try_fetch_next_clip() {
-                break;
-            }
-            let (clip, pos) = self.current_clip.as_mut().expect("fetched above");
-            let n = clip.read_frames(*pos, &mut data[written..]);
-            *pos += n;
-            written += n;
-            if clip.is_empty() {
-                self.current_clip = None;
-            }
+        // 渲染输出帧
+        let mut peak = 0.0f32;
+        for frame in data.chunks_exact_mut(2) {
+            let mut out = [0.0f32; 2];
+            backend.tick(&[], &mut out);
+            frame[0] = out[0];
+            frame[1] = out[1];
+            peak = peak.max(out[0].abs()).max(out[1].abs());
         }
-        data[written..].fill(0.0);
-    }
 
-    /// 轨道是否空闲
-    pub fn is_idle(&self) -> bool {
-        let current_done = self
-            .current_clip
-            .as_ref()
-            .map_or(true, |(g, _)| g.is_empty());
-        current_done && self.clip_queue_rx.is_empty()
-    }
-
-    /// 尝试从 Rx 队列中拉取下一个可用的 Clip
-    fn try_fetch_next_clip(&mut self) -> bool {
-        while let Ok(clip) = self.clip_queue_rx.try_recv() {
-            if let Some(c) = clip.into_current_clip() {
-                self.current_clip = Some(c);
-                return true;
-            }
-        }
-        false
-    }
-}
-
-pub struct TrackHandle {
-    clip_queue_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<ClipGroup>>,
-}
-
-impl TrackHandle {
-    /// 把一个 [ClipGroup] 送入轨道播放队列末尾。
-    pub async fn push_clip_group(
-        &self,
-        group: ClipGroup,
-    ) -> Result<(), crossfire::SendError<ClipGroup>> {
-        self.clip_queue_tx.send(group).await
-    }
-
-    /// 非阻塞推送 [ClipGroup]。队列积压满时返回 `Err(Full)`。
-    pub fn try_push_clip_group(
-        &self,
-        group: ClipGroup,
-    ) -> Result<(), crossfire::TrySendError<ClipGroup>> {
-        self.clip_queue_tx.try_send(group)
-    }
-}
-
-pub struct Clip {
-    /// Clip 的音频数据
-    sample: Vec<f32>,
-    /// true = 无论如何都跳过播放这个 Clip
-    skip: Arc<AtomicBool>,
-    /// true = 只在从 Track 队列取出时跳过播放这个 Clip
-    timeout: Arc<AtomicBool>,
-    /// Clip 播放完 drop 信号
-    _done_tx: crossfire::null::CloseHandle<crossfire::mpmc::Null>,
-}
-
-impl Clip {
-    pub fn new(sample: Vec<f32>) -> (Self, ClipHandle) {
-        let skip: Arc<AtomicBool> = Default::default();
-        let timeout: Arc<AtomicBool> = Default::default();
-        let (done_tx, done_rx): (
-            crossfire::null::CloseHandle<crossfire::mpmc::Null>,
-            crossfire::MAsyncRx<crossfire::mpmc::Null>,
-        ) = crossfire::mpmc::Null::new().new_async();
-        (
-            Self {
-                sample,
-                skip: skip.clone(),
-                timeout: timeout.clone(),
-                _done_tx: done_tx,
-            },
-            ClipHandle {
-                done_rx,
-                skip,
-                timeout,
-            },
-        )
-    }
-
-    /// 从 Clip 的第 start_idx 个元素开始向后填充 data。返回成功填充的元素数。
-    /// - `元素数 * 通道数 = 采样数`
-    /// - 直接用新值覆盖 data，不会碰未填充部分。
-    pub fn read_frames(&self, start_idx: usize, data: &mut [f32]) -> usize {
-        if self.skip.load(Ordering::Relaxed) {
-            return 0;
-        }
-        if start_idx >= self.sample.len() {
-            return 0;
-        }
-        let available = &self.sample[start_idx..];
-        let count = available.len().min(data.len());
-        data[..count].copy_from_slice(&available[..count]);
-        count
-    }
-
-    pub(crate) fn size(&self) -> usize {
-        if self.skip.load(Ordering::Relaxed) {
-            return 0;
-        }
-        self.sample.len()
-    }
-
-    pub(crate) fn timed_out(&self) -> bool {
-        self.timeout.load(Ordering::Relaxed)
-    }
-}
-
-pub struct ClipHandle {
-    skip: Arc<AtomicBool>,
-    timeout: Arc<AtomicBool>,
-    done_rx: crossfire::MAsyncRx<crossfire::mpmc::Null>,
-}
-
-impl ClipHandle {
-    /// 跳过这个 Clip。
-    pub fn skip(&self) {
-        self.skip.store(true, Ordering::Relaxed);
-    }
-
-    /// 标记这个 Clip 超时。
-    pub fn mark_timeout(&self) {
-        self.timeout.store(true, Ordering::Relaxed);
-    }
-
-    /// 等待这个 Clip 的生命周期结束。
-    pub async fn done(&self) {
-        let _ = self.done_rx.recv().await;
-    }
-
-    /// 克隆一份完成通知接收端。
-    pub fn done_rx(&self) -> crossfire::MAsyncRx<crossfire::mpmc::Null> {
-        self.done_rx.clone()
-    }
-}
-
-pub struct ClipGroup {
-    /// Clip 队列，第一个是正在播放的
-    clips: VecDeque<Clip>,
-    /// 正在播放的 Clip 进度
-    clip_pos: usize,
-    /// ClipGroup 进度
-    pos: usize,
-    skip: Arc<AtomicBool>,
-    timeout: Arc<AtomicBool>,
-    _done_tx: crossfire::null::CloseHandle<crossfire::mpmc::Null>,
-}
-
-impl ClipGroup {
-    pub fn new(clips: Vec<Clip>) -> (Self, ClipGroupHandle) {
-        debug_assert!(!clips.is_empty(), "ClipGroup can't be empty");
-        let skip: Arc<AtomicBool> = Default::default();
-        let timeout: Arc<AtomicBool> = Default::default();
-        let (done_tx, done_rx): (
-            crossfire::null::CloseHandle<crossfire::mpmc::Null>,
-            crossfire::MAsyncRx<crossfire::mpmc::Null>,
-        ) = crossfire::mpmc::Null::new().new_async();
-        (
-            Self {
-                clips: clips.into(),
-                clip_pos: 0,
-                pos: 0,
-                skip: skip.clone(),
-                timeout: timeout.clone(),
-                _done_tx: done_tx,
-            },
-            ClipGroupHandle {
-                done_rx,
-                skip,
-                timeout,
-            },
-        )
-    }
-
-    pub fn skip_items(&mut self, mut items: usize) -> usize {
-        let mut skipped = 0;
-        while items > 0 {
-            while self.clips.front().map_or(false, |c| c.timed_out()) {
-                self.clips.pop_front();
-                self.clip_pos = 0;
-            }
-            let Some(clip) = self.clips.front_mut() else {
-                break;
-            };
-            let clip_remaining = clip.size().saturating_sub(self.clip_pos);
-            if clip_remaining == 0 {
-                self.clips.pop_front();
-                self.clip_pos = 0;
-                continue;
-            }
-            if items >= clip_remaining {
-                items -= clip_remaining;
-                skipped += clip_remaining;
-                self.clips.pop_front();
-                self.clip_pos = 0;
+        // 空闲检测
+        let mode = self
+            .state
+            .mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(StandbyMode::ForcePlay);
+        if mode == StandbyMode::Auto {
+            if peak < IDLE_LEVEL {
+                let now = Instant::now();
+                let since = *self.idle_since.get_or_insert(now);
+                if !self.standby_fired && now.duration_since(since) >= STANDBY_DELAY {
+                    self.standby_fired = true;
+                    info!("output idle, requesting standby.");
+                    let _ = self.state.events_tx.try_send(MixerEvent::RequestStandby);
+                }
             } else {
-                self.clip_pos += items;
-                skipped += items;
-                items = 0;
+                self.idle_since = None;
+                self.standby_fired = false;
             }
         }
-        self.pos += skipped;
-        skipped
-    }
-
-    pub fn read_frames(&mut self, start_idx: usize, data: &mut [f32]) -> usize {
-        if self.skip.load(Ordering::Relaxed) {
-            self.clips.clear();
-            self.clip_pos = 0;
-            return 0;
-        }
-        debug_assert_eq!(start_idx, self.pos, "read backward is unsupported");
-        let mut written = 0; // 本次读出的数据量
-        while written < data.len() {
-            while self.clips.front().map_or(false, |c| c.timed_out()) {
-                self.clips.pop_front(); // 跳过已超时的 Clip
-                self.clip_pos = 0;
-            }
-            let Some(clip) = self.clips.front_mut() else {
-                break; // 队列里没有 Clip 了
-            };
-            // 读取找到的 Clip
-            let n = clip.read_frames(self.clip_pos, &mut data[written..]);
-            if n == 0 {
-                self.clips.pop_front(); // Clip 读不出东西
-                self.clip_pos = 0;
-            } else {
-                self.clip_pos += n; // 更新进度
-                written += n;
-            }
-        }
-        self.pos += written; // 更新进度
-        written
-    }
-
-    /// ClipGroup 内是否已没有可播放的 Clip
-    pub(crate) fn is_empty(&self) -> bool {
-        self.clips.is_empty()
-    }
-
-    pub fn into_current_clip(self) -> Option<(Self, usize)> {
-        if self.timeout.load(Ordering::Relaxed) {
-            None
-        } else {
-            Some((self, 0))
-        }
-    }
-}
-
-pub struct ClipGroupHandle {
-    skip: Arc<AtomicBool>,
-    timeout: Arc<AtomicBool>,
-    done_rx: crossfire::MAsyncRx<crossfire::mpmc::Null>,
-}
-
-impl ClipGroupHandle {
-    /// 跳过整个 ClipGroup。
-    pub fn skip(&self) {
-        self.skip.store(true, Ordering::Relaxed);
-    }
-
-    /// 标记整个 ClipGroup 超时。
-    pub fn mark_timeout(&self) {
-        self.timeout.store(true, Ordering::Relaxed);
-    }
-
-    /// 等待这个 ClipGroup 的生命周期结束。
-    pub async fn done(&self) {
-        let _ = self.done_rx.recv().await;
-    }
-
-    /// 克隆一份完成通知接收端。
-    pub fn done_rx(&self) -> crossfire::MAsyncRx<crossfire::mpmc::Null> {
-        self.done_rx.clone()
+        data.len()
     }
 }
 
@@ -974,241 +695,207 @@ mod tests {
         (mixers, handle, ctrl, out)
     }
 
-    /// 全链路：try_push 内容 → add_tracks → read_frames 出声（连续读不叠加）→ 播完静音 → remove
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn add_tracks_read_remove() {
-        let (mixers, handle, _ctrl, mut out) = new_mixers("test-device");
-        assert!(mixers.handle("test-device").is_some());
-
-        // 20ms 的 0.25 常量音：48000Hz * 2ch * 0.02s = 1920 元素
-        let sample = vec![0.25f32; 1920];
-        let (clip, _clip_h) = Clip::new(sample);
-        let (group, _group_h) = ClipGroup::new(vec![clip]);
-        let (track, th) = Track::new();
-        th.try_push_clip_group(group).unwrap();
-
-        let ids = handle.add_tracks(vec![track]).unwrap();
-        assert_eq!(ids.len(), 1);
-
-        // 第一帧（960 元素 = 10ms）：全 0.25
-        let mut buf = vec![0.0f32; 960];
-        let n = out.read_frames(&mut buf, Duration::from_millis(200));
-        assert_eq!(n, 960);
-        assert!(buf.iter().all(|&s| s == 0.25));
-
-        // 第二帧：乒乓 buffer 复用，值仍应是 0.25 而不是 0.5（回归：mixer_mix_tracks 漏 fill）
-        let n = out.read_frames(&mut buf, Duration::from_millis(200));
-        assert_eq!(n, 960);
-        assert!(
-            buf.iter().all(|&s| s == 0.25),
-            "buffer reuse must not accumulate"
-        );
-
-        // 内容播完（960+960=1920）：第三帧应全 0
-        let n = out.read_frames(&mut buf, Duration::from_millis(200));
-        assert_eq!(n, 960);
-        assert!(buf.iter().all(|&s| s == 0.0));
-
-        // 移除：第一次存在，第二次不存在
-        assert_eq!(handle.remove_tracks(ids.clone()).unwrap(), vec![true]);
-        assert_eq!(handle.remove_tracks(ids).unwrap(), vec![false]);
+    /// 440Hz 正弦 child（backend 原实例）
+    fn sine_child(amp: f32) -> Box<dyn AudioUnit> {
+        let mut net = Net::new(0, 2);
+        net.chain(Box::new(
+            (sine_hz::<f32>(440.0) | sine_hz::<f32>(440.0)) * amp,
+        ));
+        net.set_sample_rate(SAMPLE_RATE as f64);
+        Box::new(net.backend())
     }
 
-    /// async 推送形态 + 多轨混音：两轨 0.25 叠加 = 0.5
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn push_async_and_mix_two_tracks() {
-        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-device-mix");
+    fn read_peak(out: &mut MixerOutput, frames: usize) -> f32 {
+        let mut buf = vec![0.0f32; frames * 2];
+        let n = out.read_frames(&mut buf);
+        assert_eq!(n, frames * 2);
+        buf.iter().fold(0.0f32, |a, &v| a.max(v.abs()))
+    }
 
-        let mut tracks = Vec::new();
-        for _ in 0..2 {
-            let (clip, _ch) = Clip::new(vec![0.25f32; 960]);
-            let (group, _gh) = ClipGroup::new(vec![clip]);
-            let (track, th) = Track::new();
-            th.push_clip_group(group).await.unwrap();
-            tracks.push(track);
+    /// 全链路：attach 出声 → detach 静音（预热排空 limiter lookahead + dcblock 尾巴）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_detach_route() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-device");
+
+        let id = handle.attach_track(sine_child(0.25)).unwrap();
+        let p = read_peak(&mut out, 480);
+        assert!(
+            (0.2..0.26).contains(&p),
+            "sine 0.25 should pass through, peak={p}"
+        );
+
+        assert!(handle.detach_track(id).unwrap());
+        assert!(
+            !handle.detach_track(id).unwrap(),
+            "second detach should be false"
+        );
+
+        // 预热：limiter 排空 240 帧 + dcblock 尾巴衰减（时间常数 ~16ms，需 ~100ms 到 1e-3 下）
+        for _ in 0..10 {
+            let _ = read_peak(&mut out, 480);
         }
-        let ids = handle.add_tracks(tracks).unwrap();
-        assert_eq!(ids.len(), 2);
-
-        let mut buf = vec![0.0f32; 960];
-        let n = out.read_frames(&mut buf, Duration::from_millis(200));
-        assert_eq!(n, 960);
-        assert!(
-            buf.iter().all(|&s| s == 0.5),
-            "two 0.25 tracks should sum to 0.5"
-        );
-
-        handle.remove_tracks(ids).unwrap();
+        let p = read_peak(&mut out, 480);
+        assert!(p < 1e-3, "fully silent after drain, peak={p}");
     }
 
-    /// ClipHandle::skip：播放中跳过后面的 Clip，输出立即归零并触发 done。
+    /// attach 校验：非生成器 / 非立体声拒绝
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clip_handle_skip_interrupts_playback() {
-        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-clip-skip");
+    async fn attach_validation() {
+        let (_mixers, handle, _ctrl, _out) = new_mixers("test-device");
 
-        let (clip1, ch1) = Clip::new(vec![0.25f32; 1920]);
-        let (clip2, ch2) = Clip::new(vec![0.5f32; 1920]);
-        let (group, _gh) = ClipGroup::new(vec![clip1, clip2]);
-        let (track, th) = Track::new();
-        th.push_clip_group(group).await.unwrap();
-        handle.add_tracks(vec![track]).unwrap();
+        // 1 输入 1 输出：不是生成器
+        let mut net = Net::new(1, 1);
+        net.chain(Box::new(pass()));
+        net.set_sample_rate(SAMPLE_RATE as f64);
+        let err = handle.attach_track(Box::new(net.backend())).unwrap_err();
+        assert!(matches!(
+            err,
+            MixerCmdError::Attach(AttachError::NotGenerator { inputs: 1 })
+        ));
 
-        let mut buf = vec![0.0f32; 960];
-        // 第一帧：clip1 前半
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert!(buf.iter().all(|&s| s == 0.25));
-
-        // 第二帧：clip1 后半（读完 clip1）
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert!(buf.iter().all(|&s| s == 0.25));
-
-        // 跳过 clip2：第三帧应为 0（clip2 被丢弃，组结束）
-        ch2.skip();
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert!(
-            buf.iter().all(|&s| s == 0.0),
-            "skipped clip2 must be silent"
-        );
-
-        // clip1、clip2 与组都已结束
-        tokio::time::timeout(Duration::from_secs(1), ch1.done())
-            .await
-            .expect("clip1 done must fire");
-        tokio::time::timeout(Duration::from_secs(1), ch2.done())
-            .await
-            .expect("clip2 done must fire");
+        // 0 输入 1 输出：非立体声
+        let err = handle.attach_track(Box::new(zero())).unwrap_err();
+        assert!(matches!(
+            err,
+            MixerCmdError::Attach(AttachError::NotStereo { outputs: 1 })
+        ));
     }
 
-    /// ClipGroupHandle::mark_timeout：组还在 Track 队列里就被丢弃，不出声。
+    /// sum 树扩容：超过 GROUP_CAP 后自动开组，全部出声；摘掉中间轨不影响其它轨
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clipgroup_timeout_discards_when_not_started() {
-        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-group-timeout");
+    async fn sum_tree_expands() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-device");
 
-        let (clip, _ch) = Clip::new(vec![0.25f32; 960]);
-        let (group, gh) = ClipGroup::new(vec![clip]);
-        gh.mark_timeout();
-        let (track, th) = Track::new();
-        th.push_clip_group(group).await.unwrap();
-        handle.add_tracks(vec![track]).unwrap();
-
-        let mut buf = vec![1.0f32; 960];
-        let n = out.read_frames(&mut buf, Duration::from_millis(200));
-        assert_eq!(n, 960);
-        assert!(
-            buf.iter().all(|&s| s == 0.0),
-            "timed-out group must be discarded silently"
-        );
-
-        // 组被取出时丢弃 → done 触发
-        tokio::time::timeout(Duration::from_secs(1), gh.done())
-            .await
-            .expect("group done must fire");
-    }
-
-    /// ClipGroupHandle::skip：播放中整组跳过 → 立即静音并结束。
-    /// 回归：修复前 read_frames 不清空队列会让 mixer worker 死循环。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clipgroup_skip_stops_group_mid_playback() {
-        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-group-skip");
-
-        let (clip, _ch) = Clip::new(vec![0.25f32; 9600]);
-        let (group, gh) = ClipGroup::new(vec![clip]);
-        let (track, th) = Track::new();
-        th.push_clip_group(group).await.unwrap();
-        handle.add_tracks(vec![track]).unwrap();
-
-        let mut buf = vec![0.0f32; 960];
-        // 播放中
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert!(buf.iter().all(|&s| s == 0.25));
-
-        // 整组跳过：下帧必须正常返回全 0（而非 worker 卡死 + read 超时返回 0 且 buf 残留 0.25）
-        gh.skip();
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert!(
-            buf.iter().all(|&s| s == 0.0),
-            "skipped group must go silent"
-        );
-
-        // 再读一帧确认 worker 还活着、稳定静音
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert!(buf.iter().all(|&s| s == 0.0));
-
-        tokio::time::timeout(Duration::from_secs(1), gh.done())
-            .await
-            .expect("group done must fire");
-    }
-
-    /// mpmc done：多组并发 join（JoinSet 场景，模拟真机测试的多设备 join）
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn join_multiple_groups_with_joinset() {
-        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-joinset");
-
-        const N: usize = 4;
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..N {
-            let (clip, _ch) = Clip::new(vec![0.25f32; 960 * 2]);
-            let (group, gh) = ClipGroup::new(vec![clip]);
-            let (track, th) = Track::new();
-            th.push_clip_group(group).await.unwrap();
-            handle.add_tracks(vec![track]).unwrap();
-            // move 进独立 task join（正是真机测试的写法）
-            set.spawn(async move { gh.done().await });
+        let mut ids = Vec::new();
+        for i in 0..GROUP_CAP + 1 {
+            // 不同频率防同相叠加过激
+            let freq = [
+                440.0, 660.0, 880.0, 220.0, 330.0, 550.0, 770.0, 990.0, 110.0,
+            ][i];
+            let mut net = Net::new(0, 2);
+            net.chain(Box::new(
+                (sine_hz::<f32>(freq) | sine_hz::<f32>(freq)) * 0.05,
+            ));
+            net.set_sample_rate(SAMPLE_RATE as f64);
+            let id = handle.attach_track(Box::new(net.backend())).unwrap();
+            ids.push(id);
         }
+        // 9 轨（> GROUP_CAP=8）都 attach 成功，输出有声音
+        let p = read_peak(&mut out, 480);
+        assert!(p > 0.1, "sum of 9 tracks should be audible, peak={p}");
 
-        // 消费内容：N 组各 2 帧
-        let mut buf = vec![0.0f32; 960];
-        for _ in 0..N * 2 {
-            assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        // 摘掉第一轨和中间一轨
+        assert!(handle.detach_track(ids[0]).unwrap());
+        assert!(handle.detach_track(ids[4]).unwrap());
+        let p = read_peak(&mut out, 480);
+        assert!(p > 0.05, "remaining tracks audible, peak={p}");
+
+        // 全部摘掉 → 静音
+        for id in &ids {
+            let _ = handle.detach_track(*id).unwrap();
         }
+        for _ in 0..12 {
+            let _ = read_peak(&mut out, 480); // 预热排空
+        }
+        let p = read_peak(&mut out, 480);
+        assert!(p < 1e-3, "all detached -> silent, peak={p}");
+    }
 
-        // 全部 done 都应触发
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while let Some(res) = set.join_next().await {
-                res.expect("join task must not panic");
+    /// Auto 模式：空图读够 STANDBY_DELAY 后收到 RequestStandby
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standby_requested_when_idle() {
+        let (_mixers, handle, ctrl, mut out) = new_mixers("test-device");
+        let mut rx = ctrl.events();
+
+        // 空图（无 child）= 静音；循环读模拟 callback
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut got = false;
+        while Instant::now() < deadline {
+            let _ = read_peak(&mut out, 96);
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(MixerEvent::RequestStandby) => {
+                    got = true;
+                    break;
+                }
+                _ => {}
             }
-        })
-        .await
-        .expect("all groups must complete");
+        }
+        assert!(got, "should request standby after idle delay");
+
+        // ForcePlay 模式不应再发（避免旧事件残留：先读空）
+        handle.set_standby_mode(StandbyMode::ForcePlay).unwrap();
+        while rx.recv_timeout(Duration::ZERO).is_ok() {}
+        let _ = read_peak(&mut out, 96);
+        // 读几轮后不应有新事件
+        for _ in 0..5 {
+            let _ = read_peak(&mut out, 96);
+            assert!(
+                !matches!(
+                    rx.recv_timeout(Duration::ZERO),
+                    Ok(MixerEvent::RequestStandby)
+                ),
+                "ForcePlay must not request standby"
+            );
+        }
     }
 
-    /// clone done_rx：handle 保留控制权（还能 skip），rx 交给他处 join
+    /// 有内容时不应触发 standby；内容结束后 idle 计时重新开始
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clone_done_rx_keeps_handle() {
-        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-clone-rx");
+    async fn no_standby_while_playing() {
+        let (_mixers, handle, ctrl, mut out) = new_mixers("test-device");
+        let mut rx = ctrl.events();
+        handle.set_standby_mode(StandbyMode::Auto).unwrap();
 
-        let (clip, _ch) = Clip::new(vec![0.25f32; 960 * 10]);
-        let (group, gh) = ClipGroup::new(vec![clip]);
-        let rx1 = gh.done_rx();
-        let rx2 = gh.done_rx();
-        let (track, th) = Track::new();
-        th.push_clip_group(group).await.unwrap();
-        handle.add_tracks(vec![track]).unwrap();
+        let id = handle.attach_track(sine_child(0.2)).unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(600) {
+            let _ = read_peak(&mut out, 96);
+            assert!(
+                !matches!(
+                    rx.recv_timeout(Duration::ZERO),
+                    Ok(MixerEvent::RequestStandby)
+                ),
+                "no standby while playing"
+            );
+        }
+        handle.detach_track(id).unwrap();
 
-        // 两个独立消费者各自等 done，handle 仍留在本测试里
-        let j1 = tokio::spawn(async move { rx1.recv().await });
-        let j2 = tokio::spawn(async move { rx2.recv().await });
+        // 结束后 idle 计时（2s）内仍不应立刻触发
+        // （先预热排空 limiter/dcblock 尾巴再断言内容已停）
+        for _ in 0..5 {
+            let _ = read_peak(&mut out, 96);
+        }
+        let p = read_peak(&mut out, 96);
+        assert!(p < 0.1, "content stopped, peak={p}");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            let _ = read_peak(&mut out, 96);
+        }
+        assert!(!matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Ok(MixerEvent::RequestStandby)
+        ));
+    }
 
-        // 播 2 帧后整组 skip
-        let mut buf = vec![0.0f32; 960];
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
-        gh.skip();
-        // 下一帧驱动 skip 生效（组清空并结束）
-        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+    /// 断连恢复：渲染式跳过路径不崩、随后输出正常
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_resume_keeps_playing() {
+        let (_mixers, handle, ctrl, mut out) = new_mixers("test-device");
+        let id = handle.attach_track(sine_child(0.2)).unwrap();
+        let p = read_peak(&mut out, 480);
+        assert!(p > 0.1);
 
-        // 两个消费者都应收到完成通知
-        tokio::time::timeout(Duration::from_secs(1), j1)
-            .await
-            .expect("consumer 1 timeout")
-            .expect("consumer 1 recv");
-        tokio::time::timeout(Duration::from_secs(1), j2)
-            .await
-            .expect("consumer 2 timeout")
-            .expect("consumer 2 recv");
-        // handle 仍可用：组结束后 done() 立即返回
-        tokio::time::timeout(Duration::from_secs(1), gh.done())
-            .await
-            .expect("gh done must return");
+        // 模拟掉线：gap 150ms → 下一次 read 渲染跳过 ~7200 帧
+        ctrl.disconnected();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let p = read_peak(&mut out, 480);
+        assert!(p > 0.1, "still playing after disconnect skip, peak={p}");
+
+        // 多轮读稳定
+        for _ in 0..5 {
+            let p = read_peak(&mut out, 480);
+            assert!(p > 0.1);
+        }
+        handle.detach_track(id).unwrap();
     }
 }
