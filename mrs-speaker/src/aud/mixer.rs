@@ -1,6 +1,6 @@
 use crate::aud::{
-    GROUP_CAP, IDLE_LEVEL, L2_CAP, LIMITER_ATTACK, LIMITER_RELEASE, MAX_RENDER_SKIP_FRAMES,
-    SAMPLE_RATE, STANDBY_DELAY,
+    GROUP_CAP, L2_CAP, LIMITER_ATTACK, LIMITER_RELEASE, MAX_RENDER_SKIP_FRAMES, SAMPLE_RATE,
+    STANDBY_DELAY,
 };
 use crossfire::{BlockingTxTrait, RecvTimeoutError, select::Select};
 use dashmap::DashMap;
@@ -12,7 +12,7 @@ use my_remote_speaker::{
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -272,6 +272,7 @@ impl Mixer {
         let (backend_tx, backend_rx) = crossfire::oneshot::oneshot();
         let state = Arc::new(MixerLinkState {
             backend_errored: Default::default(),
+            track_count: Default::default(),
             disconnected: Default::default(),
             disconnect_at: AtomicInstant::new(Instant::now()),
             mode: Mutex::new(StandbyMode::Auto),
@@ -404,10 +405,16 @@ fn handle_cmd(
     match cmd {
         MixerCmd::Attach { unit, tx } => {
             let r = attach_child(net, l2, groups, unit);
+            if r.is_ok() {
+                state.track_count.fetch_add(1, Ordering::Relaxed);
+            }
             tx.send(r);
         }
         MixerCmd::Detach { id, tx } => {
             let removed = detach_child(net, groups, id);
+            if removed {
+                state.track_count.fetch_sub(1, Ordering::Relaxed);
+            }
             tx.send(removed);
         }
         MixerCmd::SetStandbyMode(mode, tx) => {
@@ -560,6 +567,8 @@ struct MixerLinkState {
     // 后端是否发生错误。
     // - 如果发生错误，stream 会静音。
     backend_errored: AtomicBool,
+    // Mixer 图中 track 数。
+    track_count: AtomicUsize,
     // stream 是否已断开连接。
     disconnected: AtomicBool,
     // 断开连接的时间。
@@ -651,13 +660,11 @@ impl MixerOutput {
         }
 
         // 渲染输出帧
-        let mut peak = 0.0f32;
         for frame in data.chunks_exact_mut(2) {
             let mut out = [0.0f32; 2];
             backend.tick(&[], &mut out);
             frame[0] = out[0];
             frame[1] = out[1];
-            peak = peak.max(out[0].abs()).max(out[1].abs());
         }
 
         // 空闲检测
@@ -668,12 +675,12 @@ impl MixerOutput {
             .map(|m| *m)
             .unwrap_or(StandbyMode::ForcePlay);
         if mode == StandbyMode::Auto {
-            if peak < IDLE_LEVEL {
+            if self.state.track_count.load(Ordering::Relaxed) == 0 {
                 let now = Instant::now();
                 let since = *self.idle_since.get_or_insert(now);
                 if !self.standby_fired && now.duration_since(since) >= STANDBY_DELAY {
                     self.standby_fired = true;
-                    info!(dev = %self.dev, "output idle, requesting standby.");
+                    info!(dev = %self.dev, "no track for a while, requesting standby.");
                     let _ = self.state.events_tx.try_send(MixerEvent::RequestStandby);
                 }
             } else {
@@ -809,7 +816,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn standby_requested_when_idle() {
         let (_mixers, handle, ctrl, mut out) = new_mixers("test-device");
-        let mut rx = ctrl.events();
+        let rx = ctrl.events();
 
         // 空图（无 child）= 静音；循环读模拟 callback
         let deadline = Instant::now() + Duration::from_secs(4);
@@ -901,5 +908,49 @@ mod tests {
             assert!(p > 0.1);
         }
         handle.detach_track(id).unwrap();
+    }
+
+    /// 回归：播放中的内容即使整段静音（如音频内嵌长静音段），也不应触发待机；
+    /// detach 后（内容真正结束）才在 STANDBY_DELAY 后触发。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_track_does_not_standby() {
+        let (_mixers, handle, ctrl, mut out) = new_mixers("test-device");
+        let rx = ctrl.events();
+        handle.set_standby_mode(StandbyMode::Auto).unwrap();
+
+        // 恒 0 输出的 track：旧的输出电平判定会误判 idle；现按 track 存在性判定
+        let mut net = Net::new(0, 2);
+        net.chain(Box::new(dc((0.0f32, 0.0f32))));
+        net.set_sample_rate(SAMPLE_RATE as f64);
+        let id = handle.attach_track(Box::new(net.backend())).unwrap();
+
+        // 读满 STANDBY_DELAY + 余量，期间不应有任何待机事件
+        let start = Instant::now();
+        while start.elapsed() < STANDBY_DELAY + Duration::from_millis(300) {
+            let _ = read_peak(&mut out, 96);
+            assert!(
+                !matches!(
+                    rx.recv_timeout(Duration::ZERO),
+                    Ok(MixerEvent::RequestStandby)
+                ),
+                "silent but attached track must not request standby"
+            );
+        }
+
+        // detach（内容结束）→ 空图 → STANDBY_DELAY 后应触发
+        assert!(handle.detach_track(id).unwrap());
+        let deadline = Instant::now() + STANDBY_DELAY + Duration::from_secs(1);
+        let mut got = false;
+        while Instant::now() < deadline {
+            let _ = read_peak(&mut out, 96);
+            if matches!(
+                rx.recv_timeout(Duration::ZERO),
+                Ok(MixerEvent::RequestStandby)
+            ) {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "standby should fire after detach + idle delay");
     }
 }

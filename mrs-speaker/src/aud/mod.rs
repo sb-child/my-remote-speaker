@@ -8,11 +8,8 @@ use std::time::Duration;
 /// Sample Rate = 48000 Hz
 pub const SAMPLE_RATE: u32 = 48000;
 
-/// 空闲请求待机延迟。
+/// 空闲请求待机延迟。host 图无任何 track 且持续此时间后请求待机。
 const STANDBY_DELAY: Duration = Duration::from_secs(2);
-
-/// 判定输出无内容的电平阈值。
-const IDLE_LEVEL: f32 = 1e-3;
 
 // 每设备轨数上限 = GROUP_CAP * L2_CAP
 
