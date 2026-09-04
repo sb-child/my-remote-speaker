@@ -21,10 +21,22 @@ pub struct Cli {
     pub command: Commands,
 }
 
+/// Audio 子命令选项
+#[derive(clap::Args, Debug, Clone)]
+pub struct AudioOpts {
+    /// 只播放设备 id 包含此子串的设备。过滤虚拟/重复节点。
+    #[arg(long)]
+    pub device: Option<String>,
+    /// 正弦幅度（默认 0.3）
+    #[arg(long, default_value_t = 0.3)]
+    pub amp: f32,
+}
+
 /// sub-commands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    Audio,
+    /// 向设备 attach 5 秒正弦再 detach
+    Audio(AudioOpts),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,13 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let args = Cli::parse();
     let task_name = format!("{:?}", args.command);
+    let audio_opts = match &args.command {
+        Commands::Audio(opts) => opts.clone(),
+    };
     let ct = CancellationToken::new();
     let tm = TaskManager::new();
     info!("Starting task {}.", task_name);
     rt.block_on(async {
         let h = tm.spawn_typed(|tm, pu, ct| async move {
             pu.update(());
-            app(args.command, tm, ct)
+            app(args.command, audio_opts, tm, ct)
                 .await
                 .map_err(|e| format!("{}", e))
         });
@@ -62,20 +77,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn app(
     command: Commands,
+    opts: AudioOpts,
     tm: TaskManager,
     ct: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = match command {
-        Commands::Audio => audio_test(tm.clone(), ct.child_token()),
+        Commands::Audio(_) => audio_test(opts, tm.clone(), ct.child_token()),
     };
     t.await
 }
 
 // -------
 
-fn sine_child(freq: f32, amp: f32) -> Box<dyn AudioUnit> {
+fn sine_track(freq: f32, amp: f32) -> Box<dyn AudioUnit> {
     let mut net = Net::new(0, 2);
-    net.chain(Box::new(
+    let _sine_id = net.chain(Box::new(
         (sine_hz::<f32>(freq) | sine_hz::<f32>(freq)) * amp,
     ));
     net.set_sample_rate(SAMPLE_RATE as f64);
@@ -83,6 +99,7 @@ fn sine_child(freq: f32, amp: f32) -> Box<dyn AudioUnit> {
 }
 
 async fn audio_test(
+    opts: AudioOpts,
     tm: TaskManager,
     ct: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -102,16 +119,21 @@ async fn audio_test(
     let devs: Vec<(String, aud::mixer::MixerHandle)> = mixers
         .devices()
         .into_iter()
-        .filter(|x| {
-            !(x.id.starts_with("pipewire:output.")
-                || x.id.starts_with("pipewire:output_default")
-                || x.id.starts_with("pipewire:output_default_legacy")
-                || x.id.starts_with("pipewire:sink_default")
-                || x.id.starts_with("pipewire:alsa_output"))
+        .filter(|x| match &opts.device {
+            Some(sub) => x.id.contains(sub.as_str()),
+            None => {
+                !(x.id.starts_with("pipewire:output.")
+                    || x.id.starts_with("pipewire:output_default")
+                    || x.id.starts_with("pipewire:sink_default"))
+            }
         })
         .filter_map(|x| mixers.handle(&x.id).map(|d| (x.id, d)))
         .collect();
-    info!("got {} devices.", devs.len());
+    info!(
+        "got {} devices: {:?}",
+        devs.len(),
+        devs.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>()
+    );
 
     info!("attach sine child to all devices (5s).");
     let mut attached = Vec::new();
@@ -119,7 +141,7 @@ async fn audio_test(
         info!("resume {}", dev_id);
         mh.resume()?;
         info!("attach.");
-        let id = mh.attach_track(sine_child(440.0, 0.3))?;
+        let id = mh.attach_track(sine_track(440.0, 0.3))?;
         info!("attached. child={:?}", id);
         attached.push(id);
     }

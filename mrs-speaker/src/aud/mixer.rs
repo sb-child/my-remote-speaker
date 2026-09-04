@@ -73,7 +73,7 @@ impl Mixers {
         if let Some(b) = self.inner.get(&info.id) {
             return (b.handle.clone(), b.ctrl.clone(), b.out.clone());
         }
-        let (mixer, handle, ctrl, out) = Mixer::create(&self.tm, &self.ct);
+        let (mixer, handle, ctrl, out) = Mixer::create(&self.tm, &self.ct, &info.id);
         let ret = (handle.clone(), ctrl.clone(), out.clone());
         self.inner.insert(
             info.id.clone(),
@@ -264,6 +264,7 @@ impl Mixer {
     fn create(
         tm: &TaskManager,
         ct: &CancellationToken,
+        dev_id: &str,
     ) -> (Self, MixerHandle, MixerController, MixerOutput) {
         let mixer_ct = ct.child_token();
         let (cmd_tx, cmd_rx) = crossfire::mpmc::bounded_blocking(16);
@@ -302,6 +303,7 @@ impl Mixer {
             MixerOutput {
                 backend: Arc::new(Mutex::new(backend)),
                 state,
+                dev: dev_id.to_owned(),
                 idle_since: None,
                 standby_fired: false,
             },
@@ -603,7 +605,9 @@ impl MixerController {
 pub struct MixerOutput {
     backend: Arc<Mutex<NetBackend>>,
     state: Arc<MixerLinkState>,
-    /// 空闲计时（读线程独占；clone 后重新计时，无碍）
+    /// 设备 id
+    dev: String,
+    /// 空闲计时
     idle_since: Option<Instant>,
     standby_fired: bool,
 }
@@ -638,7 +642,7 @@ impl MixerOutput {
                 frames
             };
             if frames > 0 {
-                warn!(frames, "rendering skip after disconnect");
+                warn!(dev = %self.dev, frames, "rendering skip after disconnect");
                 let mut scratch = [0.0f32; 2];
                 for _ in 0..frames {
                     backend.tick(&[], &mut scratch);
@@ -669,7 +673,7 @@ impl MixerOutput {
                 let since = *self.idle_since.get_or_insert(now);
                 if !self.standby_fired && now.duration_since(since) >= STANDBY_DELAY {
                     self.standby_fired = true;
-                    info!("output idle, requesting standby.");
+                    info!(dev = %self.dev, "output idle, requesting standby.");
                     let _ = self.state.events_tx.try_send(MixerEvent::RequestStandby);
                 }
             } else {
