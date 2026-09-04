@@ -191,18 +191,25 @@ fn get_device_status(
     }
 }
 
+<<<<<<< HEAD
 #[derive(Snafu, Debug)]
 pub enum HostHandlerError {
     EnumerateFailed { source: cpal::Error },
     Cancelled,
 }
 
+=======
+>>>>>>> 63a10ae4e65b9a3989c00c6d6a51dda6ce12d274
 pub fn host_handler(
     tm: TaskManager,
     pu: ProgressUpdater<()>,
     ct: CancellationToken,
     mixers: Arc<Mixers>,
+<<<<<<< HEAD
 ) -> Result<(), HostHandlerError> {
+=======
+) {
+>>>>>>> 63a10ae4e65b9a3989c00c6d6a51dda6ce12d274
     let audio_host = cpal::default_host();
     enum Action {
         OnDeviceAdd(Option<cpal::DeviceDescription>),
@@ -281,9 +288,13 @@ pub fn host_handler(
         } else {
             thread::sleep(Duration::from_secs(1));
         }
+<<<<<<< HEAD
         if all_devices_settled(&device_handles) {
             pu.update(()); // devices are inited
         }
+=======
+        pu.update(()); // devices are inited
+>>>>>>> 63a10ae4e65b9a3989c00c6d6a51dda6ce12d274
     }
 }
 
