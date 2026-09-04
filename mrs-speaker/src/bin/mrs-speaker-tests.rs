@@ -110,7 +110,7 @@ async fn audio_test(
     let mixers2 = mixers.clone();
     let h = tm.spawn_blocking_typed(move |tm, pu, ct| {
         pu.update(());
-        host_handler(tm, mixers2, ct);
+        host_handler(tm, pu, ct, mixers2);
         Ok::<(), ()>(())
     });
     h.cancel_at(&ct);

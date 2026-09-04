@@ -2,8 +2,14 @@ pub mod handler;
 pub mod mixer;
 pub mod scheduler;
 
-use my_remote_speaker::task::TaskManager;
-use std::time::Duration;
+use crate::aud::{
+    handler::{HostHandlerError, host_handler},
+    mixer::Mixers,
+};
+use my_remote_speaker::task::{TaskManager, TypedTaskState};
+use snafu::prelude::*;
+use std::{sync::Arc, time::Duration};
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Sample Rate = 48000 Hz
 pub const SAMPLE_RATE: u32 = 48000;
@@ -26,10 +32,52 @@ const LIMITER_ATTACK: f32 = 0.005;
 /// master 链的 limiter release 参数
 const LIMITER_RELEASE: f32 = 0.15;
 
-pub struct AudioManager {}
+pub struct AudioManager {
+    _guard: DropGuard,
+}
 
 impl AudioManager {
-    pub fn new(_tm: TaskManager) -> Self {
-        Self {}
+    pub async fn new(tm: TaskManager, ct: CancellationToken) -> Result<Self, AudioManagerError> {
+        let mixers = Arc::new(Mixers::new(tm.clone(), ct.clone()));
+        let mixers_for_host_handler = mixers.clone();
+        let h = tm.spawn_blocking_typed(move |tm, pu, ct| {
+            host_handler(tm, pu, ct, mixers_for_host_handler)?;
+            Ok::<(), HostHandlerError>(())
+        });
+        h.cancel_at(&ct);
+        let s = h.wait_for(|s| s.is_running()).await;
+        ensure!(
+            matches!(
+                s,
+                TypedTaskState::Cancelled
+                    | TypedTaskState::Cancelling
+                    | TypedTaskState::Completed(_)
+            ),
+            HostHandlerExitedSnafu
+        );
+        if !s.is_running() {
+            // todo
+            match s {
+                TypedTaskState::Cancelled | TypedTaskState::Cancelling => {}
+                TypedTaskState::Completed(_) => {}
+                TypedTaskState::Failed(_) => todo!(),
+                TypedTaskState::Cancelled => todo!(),
+                TypedTaskState::Panicked(_) => todo!(),
+                _ => {
+                    unreachable!()
+                }
+            }
+        }
+
+        Ok(Self {
+            _guard: ct.drop_guard(),
+        })
     }
+}
+
+#[derive(Snafu, Debug)]
+pub enum AudioManagerError {
+    HostHandler { source: HostHandlerError },
+    HostHandlerExited,
+    HostHandlerPanicked { msg: String },
 }
