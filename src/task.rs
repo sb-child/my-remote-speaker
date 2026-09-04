@@ -499,6 +499,7 @@ impl TaskManager {
         }
         let token = CancellationToken::new();
         let task_token = token.clone();
+        let terminal_token = token.clone();
         let progress = ProgressUpdater {
             tasks: self.tasks.clone(),
             changes: self.changes.clone(),
@@ -536,6 +537,7 @@ impl TaskManager {
                     false => terminal_state,
                 }
             });
+            terminal_token.cancel();
         });
         self.handles.insert(task_id, (worker_handle, token, None));
         if self.closed.load(Ordering::SeqCst) {
@@ -570,6 +572,7 @@ impl TaskManager {
         }
         let token = CancellationToken::new();
         let task_token = token.clone();
+        let terminal_token = token.clone();
         let progress = ProgressUpdater {
             tasks: self.tasks.clone(),
             changes: self.changes.clone(),
@@ -612,6 +615,7 @@ impl TaskManager {
                     false => terminal_state,
                 }
             });
+            terminal_token.cancel();
         });
         self.handles
             .insert(task_id, (worker_handle, token, Some(death_rx)));

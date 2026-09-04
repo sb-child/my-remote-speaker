@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
 use mrs_speaker::aud::{
-    self,
+    self, SAMPLE_RATE,
     handler::host_handler,
     mixer::{Clip, ClipGroup, ClipGroupHandle, MixerHandle, Mixers, Track},
 };
 use my_remote_speaker::task::TaskManager;
-use std::{ops::Index, sync::Arc, time::Duration};
+use std::{f32::consts::PI, ops::Index, sync::Arc, time::Duration};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -47,24 +47,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_name = format!("{:?}", args.command);
     let ct = CancellationToken::new();
     let tm = TaskManager::new();
-    let t = match args.command {
-        Commands::Audio => audio_test(tm.clone(), ct.child_token()),
-    };
     info!("Starting task {}.", task_name);
-    let r = rt.block_on(async {
+    rt.block_on(async {
+        let h = tm.spawn_typed(|tm, pu, ct| async move {
+            pu.update(());
+            app(args.command, tm, ct)
+                .await
+                .map_err(|e| format!("{}", e))
+        });
+        h.cancel_at(&ct);
         tokio::select! {
-            r = tokio::signal::ctrl_c() => { tm.close(); ct.cancel(); r.map_err(|e| Box::new(e).into()) }
-            r = t => { r.map_err(|e| e) }
+            _r = tokio::signal::ctrl_c() => { error!("ctrl-c trigged."); }
+            r = h.wait_terminal() => { error!("Task result: {:?}", r); }
         }
+        tm.close();
     });
-    match r {
-        Ok(r) => info!("Task returns {:?}", r),
-        Err(e) => error!("Task returns {}", e),
-    }
     warn!("Shutting down tokio runtime...");
     rt.shutdown_timeout(Duration::from_secs(5));
     warn!("Stopped.");
     Ok(())
+}
+
+async fn app(
+    command: Commands,
+    tm: TaskManager,
+    ct: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t = match command {
+        Commands::Audio => audio_test(tm.clone(), ct.child_token()),
+    };
+    t.await
 }
 
 // -------
@@ -178,16 +190,27 @@ async fn audio_test(
 }
 
 fn generate_440hz_stereo(duration_secs: f32, left_pan: f32, right_pan: f32) -> Vec<f32> {
-    const SAMPLE_RATE: f32 = 48000.0;
     const FREQUENCY: f32 = 440.0;
-    let frames = (SAMPLE_RATE * duration_secs) as usize;
+    let frames = (SAMPLE_RATE as f32 * duration_secs) as usize;
     let total_samples = frames * 2;
     let mut buffer = Vec::with_capacity(total_samples);
-    let omega = 2.0 * std::f32::consts::PI * FREQUENCY / SAMPLE_RATE;
+    let omega = 2.0 * PI * FREQUENCY / SAMPLE_RATE as f32;
     for i in 0..frames {
         let sample = (i as f32 * omega).sin();
         buffer.push(sample * left_pan);
         buffer.push(sample * right_pan);
+    }
+    let total_frames = buffer.len() / 2;
+    let fade_frames = (SAMPLE_RATE as f32 * 0.005) as usize;
+    for i in 0..fade_frames {
+        let g = 0.5 * (1.0 - (i as f32 / fade_frames as f32 * PI).cos());
+        // fade-in
+        buffer[i * 2] *= g;
+        buffer[i * 2 + 1] *= g;
+        // fade-out
+        let j = total_frames - fade_frames + i;
+        buffer[j * 2] *= g;
+        buffer[j * 2 + 1] *= g;
     }
     buffer
 }

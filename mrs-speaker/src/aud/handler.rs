@@ -33,6 +33,7 @@ fn on_device_add(
     dh: &mut DeviceHandles,
     mixers: &Mixers,
     tm: &TaskManager,
+    ct: CancellationToken,
 ) {
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, desc.as_ref());
@@ -41,6 +42,7 @@ fn on_device_add(
         tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
     });
+    h.cancel_at(&ct);
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task started. Cancelling old task.");
         old_task.cancel(); // maybe unreachable
@@ -77,6 +79,7 @@ fn on_device_online(
     dh: &mut DeviceHandles,
     mixers: &Mixers,
     tm: &TaskManager,
+    ct: CancellationToken,
 ) -> bool {
     if let Some(task) = dh.get(&dev_id) {
         let s = get_device_status(dev_id_str.clone(), task.status());
@@ -93,6 +96,7 @@ fn on_device_online(
         tc.update(()); // todo
         device_handler(&dev_id_str, &dev_id_2, ct, mixer_ctrl, mixer_out)
     });
+    h.cancel_at(&ct);
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task restarted. Cancelling old task.");
         old_task.cancel(); // maybe unreachable
@@ -214,6 +218,7 @@ pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken)
                     &mut device_handles,
                     &mixers,
                     &tm,
+                    ct.child_token(),
                 ),
                 Action::OnDeviceDel => {
                     on_device_del(dev_id_str, dev_id, &mut device_handles, &mixers, &tm)
@@ -227,6 +232,7 @@ pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken)
                         &mut device_handles,
                         &mixers,
                         &tm,
+                        ct.child_token(),
                     );
                     if should_blacklist_this {
                         prev_devices.insert(dev_id, true);
@@ -235,10 +241,7 @@ pub fn host_handler(tm: TaskManager, mixers: Arc<Mixers>, ct: CancellationToken)
             }
         }
         if ct.is_cancelled() {
-            error!("Cancelled. Stopping all handles.");
-            for (_, h) in &device_handles {
-                h.cancel();
-            }
+            error!("Cancelled.");
             break;
         } else {
             thread::sleep(Duration::from_secs(1));
