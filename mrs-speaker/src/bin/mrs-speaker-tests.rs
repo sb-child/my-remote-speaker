@@ -112,12 +112,14 @@ async fn audio_test(
         .iter()
         .filter(|x| {
             !(x.id.starts_with("pipewire:alsa_output")
-                || x.id.starts_with("pipewire:alsa_output")
-                || x.id.starts_with("pipewire:dc_blocker_sink")
+                || x.id.starts_with("pipewire:output.dc_blocker_sink")
                 || x.id.starts_with("pipewire:sink_default")
                 || x.id.starts_with("pipewire:output_default"))
         })
-        .map(|x| mixers.handle(&x.id))
+        .map(|x| {
+            info!("device: {}", x.id);
+            mixers.handle(&x.id)
+        })
         .flatten()
         .collect();
     info!("got {} devices.", devs.len());
