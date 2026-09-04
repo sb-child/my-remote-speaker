@@ -128,10 +128,10 @@ pub type MixerEventRx = crossfire::MRx<crossfire::mpmc::Array<MixerEvent>>;
 /// 空闲待机模式
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandbyMode {
-    /// 默认：输出空闲（低电平）`STANDBY_DELAY` 后请求暂停 stream，有内容时由调用方 resume。
+    /// 默认：没有 Track 持续 STANDBY_DELAY 后请求暂停 stream，有内容时由调用方 resume。
     Auto,
-    /// 强制 stream 一直保持运行
-    ForcePlay,
+    /// 强制 stream 一直保持运行。
+    Manually,
 }
 
 impl Default for StandbyMode {
@@ -514,8 +514,8 @@ pub struct MixerHandle {
 
 impl MixerHandle {
     /// 设置空闲待机模式。
-    /// - Auto：输出空闲超时自动待机。
-    /// - ForcePlay：保持播放不待机。
+    /// - Auto：没有 Track 接入自动待机。
+    /// - Manually：保持播放不待机。
     pub fn set_standby_mode(&self, mode: StandbyMode) -> Result<(), MixerCmdError> {
         let (tx, rx) = crossfire::oneshot::oneshot();
         self.cmd_tx
@@ -673,7 +673,7 @@ impl MixerOutput {
             .mode
             .lock()
             .map(|m| *m)
-            .unwrap_or(StandbyMode::ForcePlay);
+            .unwrap_or(StandbyMode::Manually);
         if mode == StandbyMode::Auto {
             if self.state.track_count.load(Ordering::Relaxed) == 0 {
                 let now = Instant::now();
@@ -833,8 +833,8 @@ mod tests {
         }
         assert!(got, "should request standby after idle delay");
 
-        // ForcePlay 模式不应再发（避免旧事件残留：先读空）
-        handle.set_standby_mode(StandbyMode::ForcePlay).unwrap();
+        // Manually 模式不应再发（避免旧事件残留：先读空）
+        handle.set_standby_mode(StandbyMode::Manually).unwrap();
         while rx.recv_timeout(Duration::ZERO).is_ok() {}
         let _ = read_peak(&mut out, 96);
         // 读几轮后不应有新事件
@@ -845,7 +845,7 @@ mod tests {
                     rx.recv_timeout(Duration::ZERO),
                     Ok(MixerEvent::RequestStandby)
                 ),
-                "ForcePlay must not request standby"
+                "Manually mode must not request standby"
             );
         }
     }
@@ -854,7 +854,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_standby_while_playing() {
         let (_mixers, handle, ctrl, mut out) = new_mixers("test-device");
-        let mut rx = ctrl.events();
+        let rx = ctrl.events();
         handle.set_standby_mode(StandbyMode::Auto).unwrap();
 
         let id = handle.attach_track(sine_child(0.2)).unwrap();
