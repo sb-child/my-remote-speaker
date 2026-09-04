@@ -2,10 +2,11 @@ use clap::{Parser, Subcommand};
 use mrs_speaker::aud::{
     self,
     handler::host_handler,
-    mixer::{Clip, ClipGroup, Mixers, Track},
+    mixer::{Clip, ClipGroup, MixerHandle, Mixers, Track},
 };
 use my_remote_speaker::task::TaskManager;
 use std::{ops::Index, sync::Arc, time::Duration};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -84,21 +85,70 @@ async fn audio_test(
     });
     h.cancel_at(&ct);
 
-    info!("get device.");
-    let dev_id = "pipewire:dc_blocker_sink_EDIFIER_M16_Pro";
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let mh = mixers.handle(dev_id).ok_or("No device found.")?;
+    for dev in mixers.devices() {
+        let dev_id = &dev.id;
+        info!("got device {}.", dev_id);
+        let mh = mixers.handle(dev_id).ok_or("No device found.")?;
 
-    info!("create track.");
-    let (track, th) = Track::new();
-    let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
-    let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
-    let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
-    th.push_clip_group(clipgroup).await?;
+        info!("create track.");
+        let (track, th) = Track::new();
+        let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
+        let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
+        let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
+        th.push_clip_group(clipgroup).await?;
 
-    info!("play track.");
-    let track = mh.add_tracks(vec![track]).map_err(|e| format!("{:?}", e))?;
-    let track_id = track.get(0).ok_or("no track id.")?;
+        info!("resume stream.");
+        mh.resume().map_err(|e| format!("{:?}", e))?;
+        info!("play track.");
+        let track = mh.add_tracks(vec![track]).map_err(|e| format!("{:?}", e))?;
+        let track_id = track.get(0).ok_or("no track id.")?;
+        cgh.done().await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let devs: Vec<MixerHandle> = mixers
+        .devices()
+        .iter()
+        .filter(|x| {
+            !(x.id.starts_with("pipewire:alsa_output")
+                || x.id.starts_with("pipewire:alsa_output")
+                || x.id.starts_with("pipewire:dc_blocker_sink")
+                || x.id.starts_with("pipewire:sink_default")
+                || x.id.starts_with("pipewire:output_default"))
+        })
+        .map(|x| mixers.handle(&x.id))
+        .flatten()
+        .collect();
+    info!("got {} devices.", devs.len());
+    let tracks = Vec::new();
+    let track_handles = Vec::new();
+    for _ in 0..devs.len() {
+        info!("create tracks.");
+        let (track, th) = Track::new();
+        let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
+        let (clip_right, crh) = Clip::new(generate_440hz_stereo(1., 0.0, 0.8));
+        let (clipgroup, cgh) = ClipGroup::new(vec![clip_left, clip_right]);
+        th.push_clip_group(clipgroup).await?;
+        tracks.push(track);
+        track_handles.push((th, clh, crh, cgh));
+    }
+    info!("resume streams.");
+    for d in &devs {
+        d.resume().map_err(|e| format!("{:?}", e))?;
+    }
+    info!("play tracks.");
+    for d in &devs {
+        let t = tracks.pop().ok_or("no track left.")?;
+        let track = d.add_tracks(vec![t]).map_err(|e| format!("{:?}", e))?;
+        let track_id = track.get(0).ok_or("no track id.")?;
+    }
+    info!("wait complete.");
+    let set = JoinSet::new();
+    for (_, _, _, cgh) in track_handles {
+        set.spawn(async move { cgh.done().await });
+    }
+    set.join_all().await;
 
     info!("test done.");
     tokio::time::sleep(Duration::from_secs(10)).await;

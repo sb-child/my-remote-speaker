@@ -311,9 +311,9 @@ fn device_handler(
     Ok(())
 }
 
-#[instrument(skip_all, fields(device = _dev_id, supp_2ch = support_2ch, supp_f32 = support_f32))]
+#[instrument(skip_all, fields(device = dev_id, supp_2ch = support_2ch, supp_f32 = support_f32))]
 fn stream_handler(
-    _dev_id: &str,
+    dev_id: &str,
     device: cpal::Device,
     stream_config: StreamConfig,
     device_wait_timeout: Duration,
@@ -334,6 +334,7 @@ fn stream_handler(
         }
         info!("Building output stream...");
         mixer_ctrl.reset();
+        let dev_id_string = dev_id.to_string();
         let mc_for_err_cb = mixer_ctrl.clone();
         let mut mo_for_stream_cb = mixer_out.clone();
         let restart_tx_cb = restart_tx.clone();
@@ -352,7 +353,7 @@ fn stream_handler(
                         &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx_cb),
+                move |e| stream_error_callback(&dev_id_string, e, &mc_for_err_cb, &restart_tx_cb),
                 Some(device_wait_timeout),
             )
         } else {
@@ -368,7 +369,7 @@ fn stream_handler(
                         &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(e, &mc_for_err_cb, &restart_tx_cb),
+                move |e| stream_error_callback(&dev_id_string, e, &mc_for_err_cb, &restart_tx_cb),
                 Some(device_wait_timeout),
             )
         };
@@ -470,25 +471,29 @@ fn stream_handle_event(
     }
 }
 
+#[instrument(skip_all, fields(device = _dev_id))]
 fn stream_error_callback(
+    _dev_id: &str,
     err: cpal::Error,
     mc: &MixerController,
     restart_tx: &crossfire::MTx<crossfire::mpsc::Array<cpal::Error>>,
 ) {
     match err.kind() {
-        cpal::ErrorKind::DeviceBusy
+        e @ (cpal::ErrorKind::DeviceBusy
         | cpal::ErrorKind::DeviceNotAvailable
         | cpal::ErrorKind::HostUnavailable
         | cpal::ErrorKind::PermissionDenied
         | cpal::ErrorKind::ResourceExhausted
         | cpal::ErrorKind::StreamInvalidated
         | cpal::ErrorKind::BackendError
-        | cpal::ErrorKind::Other => {
+        | cpal::ErrorKind::Other) => {
             // restart
             mc.disconnected();
+            error!("got error, restarting device handler: {}", e);
             restart_tx.send(err).ok();
         }
-        _ => {
+        e => {
+            warn!("ignored error: {}", e);
             // ignore
         }
     };

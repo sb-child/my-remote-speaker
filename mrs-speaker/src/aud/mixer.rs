@@ -797,6 +797,23 @@ pub struct ClipHandle {
     done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
 }
 
+impl ClipHandle {
+    /// 跳过这个 Clip。
+    pub fn skip(&self) {
+        self.skip.store(true, Ordering::Relaxed);
+    }
+
+    /// 标记这个 Clip 超时。
+    pub fn mark_timeout(&self) {
+        self.timeout.store(true, Ordering::Relaxed);
+    }
+
+    /// 等待这个 Clip 的生命周期结束。
+    pub async fn done(&self) {
+        let _ = self.done_rx.recv().await;
+    }
+}
+
 pub struct ClipGroup {
     /// Clip 队列，第一个是正在播放的
     clips: VecDeque<Clip>,
@@ -845,7 +862,7 @@ impl ClipGroup {
             let Some(clip) = self.clips.front_mut() else {
                 break;
             };
-            let clip_remaining = clip.size() - self.clip_pos;
+            let clip_remaining = clip.size().saturating_sub(self.clip_pos);
             if clip_remaining == 0 {
                 self.clips.pop_front();
                 self.clip_pos = 0;
@@ -868,6 +885,8 @@ impl ClipGroup {
 
     pub fn read_frames(&mut self, start_idx: usize, data: &mut [f32]) -> usize {
         if self.skip.load(Ordering::Relaxed) {
+            self.clips.clear();
+            self.clip_pos = 0;
             return 0;
         }
         debug_assert_eq!(start_idx, self.pos, "read backward is unsupported");
@@ -912,6 +931,23 @@ pub struct ClipGroupHandle {
     skip: Arc<AtomicBool>,
     timeout: Arc<AtomicBool>,
     done_rx: crossfire::AsyncRx<crossfire::mpsc::Null>,
+}
+
+impl ClipGroupHandle {
+    /// 跳过整个 ClipGroup。
+    pub fn skip(&self) {
+        self.skip.store(true, Ordering::Relaxed);
+    }
+
+    /// 标记整个 ClipGroup 超时。
+    pub fn mark_timeout(&self) {
+        self.timeout.store(true, Ordering::Relaxed);
+    }
+
+    /// 等待这个 ClipGroup 的生命周期结束。
+    pub async fn done(&self) {
+        let _ = self.done_rx.recv().await;
+    }
 }
 
 #[cfg(test)]
@@ -993,5 +1029,103 @@ mod tests {
         );
 
         handle.remove_tracks(ids).unwrap();
+    }
+
+    /// ClipHandle::skip：播放中跳过后面的 Clip，输出立即归零并触发 done。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clip_handle_skip_interrupts_playback() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-clip-skip");
+
+        let (clip1, ch1) = Clip::new(vec![0.25f32; 1920]);
+        let (clip2, ch2) = Clip::new(vec![0.5f32; 1920]);
+        let (group, _gh) = ClipGroup::new(vec![clip1, clip2]);
+        let (track, th) = Track::new();
+        th.push_clip_group(group).await.unwrap();
+        handle.add_tracks(vec![track]).unwrap();
+
+        let mut buf = vec![0.0f32; 960];
+        // 第一帧：clip1 前半
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert!(buf.iter().all(|&s| s == 0.25));
+
+        // 第二帧：clip1 后半（读完 clip1）
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert!(buf.iter().all(|&s| s == 0.25));
+
+        // 跳过 clip2：第三帧应为 0（clip2 被丢弃，组结束）
+        ch2.skip();
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert!(
+            buf.iter().all(|&s| s == 0.0),
+            "skipped clip2 must be silent"
+        );
+
+        // clip1、clip2 与组都已结束
+        tokio::time::timeout(Duration::from_secs(1), ch1.done())
+            .await
+            .expect("clip1 done must fire");
+        tokio::time::timeout(Duration::from_secs(1), ch2.done())
+            .await
+            .expect("clip2 done must fire");
+    }
+
+    /// ClipGroupHandle::mark_timeout：组还在 Track 队列里就被丢弃，不出声。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clipgroup_timeout_discards_when_not_started() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-group-timeout");
+
+        let (clip, _ch) = Clip::new(vec![0.25f32; 960]);
+        let (group, gh) = ClipGroup::new(vec![clip]);
+        gh.mark_timeout();
+        let (track, th) = Track::new();
+        th.push_clip_group(group).await.unwrap();
+        handle.add_tracks(vec![track]).unwrap();
+
+        let mut buf = vec![1.0f32; 960];
+        let n = out.read_frames(&mut buf, Duration::from_millis(200));
+        assert_eq!(n, 960);
+        assert!(
+            buf.iter().all(|&s| s == 0.0),
+            "timed-out group must be discarded silently"
+        );
+
+        // 组被取出时丢弃 → done 触发
+        tokio::time::timeout(Duration::from_secs(1), gh.done())
+            .await
+            .expect("group done must fire");
+    }
+
+    /// ClipGroupHandle::skip：播放中整组跳过 → 立即静音并结束。
+    /// 回归：修复前 read_frames 不清空队列会让 mixer worker 死循环。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clipgroup_skip_stops_group_mid_playback() {
+        let (_mixers, handle, _ctrl, mut out) = new_mixers("test-group-skip");
+
+        let (clip, _ch) = Clip::new(vec![0.25f32; 9600]);
+        let (group, gh) = ClipGroup::new(vec![clip]);
+        let (track, th) = Track::new();
+        th.push_clip_group(group).await.unwrap();
+        handle.add_tracks(vec![track]).unwrap();
+
+        let mut buf = vec![0.0f32; 960];
+        // 播放中
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert!(buf.iter().all(|&s| s == 0.25));
+
+        // 整组跳过：下帧必须正常返回全 0（而非 worker 卡死 + read 超时返回 0 且 buf 残留 0.25）
+        gh.skip();
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert!(
+            buf.iter().all(|&s| s == 0.0),
+            "skipped group must go silent"
+        );
+
+        // 再读一帧确认 worker 还活着、稳定静音
+        assert_eq!(out.read_frames(&mut buf, Duration::from_millis(200)), 960);
+        assert!(buf.iter().all(|&s| s == 0.0));
+
+        tokio::time::timeout(Duration::from_secs(1), gh.done())
+            .await
+            .expect("group done must fire");
     }
 }
