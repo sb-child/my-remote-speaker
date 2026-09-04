@@ -98,11 +98,23 @@ async fn audio_test(
     h.cancel_at(&ct);
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    for dev in mixers.devices() {
-        let dev_id = &dev.id;
-        info!("got device {}.", dev_id);
-        let mh = mixers.handle(dev_id).ok_or("No device found.")?;
+    let devs: Vec<(String, MixerHandle)> = mixers
+        .devices()
+        .into_iter()
+        .filter(|x| {
+            !(x.id.starts_with("pipewire:output.")
+                || x.id.starts_with("pipewire:sink_default")
+                || x.id.starts_with("pipewire:output_default"))
+        })
+        .map(|x| {
+            info!("device: {}", x.id);
+            mixers.handle(&x.id).map(|d| (x.id, d))
+        })
+        .flatten()
+        .collect();
+    info!("got {} devices.", devs.len());
 
+    for (dev_id, mh) in devs {
         info!("create track.");
         let (track, th) = Track::new();
         let (clip_left, clh) = Clip::new(generate_440hz_stereo(1., 0.8, 0.0));
@@ -121,7 +133,7 @@ async fn audio_test(
     tokio::time::sleep(Duration::from_secs(1)).await;
     let devs: Vec<MixerHandle> = mixers
         .devices()
-        .iter()
+        .into_iter()
         .filter(|x| {
             !(x.id.starts_with("pipewire:alsa_output")
                 || x.id.starts_with("pipewire:output.dc_blocker_sink")
@@ -135,6 +147,7 @@ async fn audio_test(
         .flatten()
         .collect();
     info!("got {} devices.", devs.len());
+
     let mut tracks: Vec<Track> = Vec::new();
     let mut track_handles: Vec<ClipGroupHandle> = Vec::new();
     for _ in 0..devs.len() {
