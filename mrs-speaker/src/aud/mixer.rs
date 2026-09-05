@@ -656,11 +656,11 @@ impl MixerOutput {
             if frames > 0 {
                 warn!(dev = %self.dev, frames, "rendering skip after disconnect");
                 let zero = F32x::splat(0.0);
-                let mut simd = [zero; 16];
+                let mut simd = [zero; 2 * SIMD_LEN];
                 let mut out_buf = BufferMut::new(&mut simd);
                 let mut done = 0;
                 while done < frames {
-                    let chunk = Ord::min(frames - done, 64);
+                    let chunk = Ord::min(frames - done, MAX_BUFFER_SIZE);
                     backend.process(chunk, &BufferRef::empty(), &mut out_buf);
                     done += chunk;
                 }
@@ -670,11 +670,11 @@ impl MixerOutput {
         // 渲染输出帧
         let n_frames = data.len() / 2;
         let zero = F32x::splat(0.0);
-        let mut simd = [zero; 16]; // 2ch * 8 个 SIMD 字 = 2 x 64 帧 planar
+        let mut simd = [zero; 2 * SIMD_LEN]; // 2ch * 8 个 SIMD 字 = 2 x 64 帧 planar
         let mut out_buf = BufferMut::new(&mut simd);
         let mut pos = 0;
         while pos < n_frames {
-            let chunk = Ord::min(n_frames - pos, 64);
+            let chunk = Ord::min(n_frames - pos, MAX_BUFFER_SIZE);
             backend.process(chunk, &BufferRef::empty(), &mut out_buf);
             let l = out_buf.channel_f32(0);
             let r = out_buf.channel_f32(1);
