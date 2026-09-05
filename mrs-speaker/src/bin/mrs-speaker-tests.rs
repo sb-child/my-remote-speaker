@@ -71,8 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _r = tokio::signal::ctrl_c() => { error!("ctrl-c trigged."); }
             _r = h.wait_terminal() => {}
         }
-        Ok(())
-    })
+        tm.close();
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    info!("Shutdown runtime...");
+    rt.shutdown_timeout(Duration::from_secs(5));
+    info!("Runtime is down.");
+    Ok(())
 }
 
 async fn app(

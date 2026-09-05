@@ -198,8 +198,8 @@ fn get_device_status(
             },
         },
         TypedTaskState::Panicked(p) => {
-            info!("Task panicked. Will not restart: {}", p);
-            None
+            info!("Task panicked, restarting: {}", p);
+            Some(false)
         }
         TypedTaskState::Cancelling => {
             warn!("Cancelling by TaskManager. Will not restart.");

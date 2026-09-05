@@ -681,22 +681,11 @@ impl TaskManager {
         let tm = self.clone();
         let ct = ct.clone();
         tokio::spawn(async move {
-            loop {
-                let check = tokio::time::timeout(Duration::from_millis(500), ct.cancelled()).await;
-                if let Err(_) = check {
-                    if tm.is_closed() {
-                        break;
-                    } else if tm
-                        .get_status(task_id)
-                        .map(|s| s.is_terminal())
-                        .unwrap_or(true)
-                    {
-                        break;
-                    }
-                } else {
+            tokio::select! {
+                _ = ct.cancelled() => {
                     tm.cancel_task(task_id);
-                    break;
                 }
+                _ = tm.wait_terminal(task_id) => {}
             }
         });
     }
