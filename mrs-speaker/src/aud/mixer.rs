@@ -655,19 +655,34 @@ impl MixerOutput {
             };
             if frames > 0 {
                 warn!(dev = %self.dev, frames, "rendering skip after disconnect");
-                let mut scratch = [0.0f32; 2];
-                for _ in 0..frames {
-                    backend.tick(&[], &mut scratch);
+                let zero = F32x::splat(0.0);
+                let mut simd = [zero; 16];
+                let mut out_buf = BufferMut::new(&mut simd);
+                let mut done = 0;
+                while done < frames {
+                    let chunk = Ord::min(frames - done, 64);
+                    backend.process(chunk, &BufferRef::empty(), &mut out_buf);
+                    done += chunk;
                 }
             }
         }
 
         // 渲染输出帧
-        for frame in data.chunks_exact_mut(2) {
-            let mut out = [0.0f32; 2];
-            backend.tick(&[], &mut out);
-            frame[0] = out[0];
-            frame[1] = out[1];
+        let n_frames = data.len() / 2;
+        let zero = F32x::splat(0.0);
+        let mut simd = [zero; 16]; // 2ch * 8 个 SIMD 字 = 2 x 64 帧 planar
+        let mut out_buf = BufferMut::new(&mut simd);
+        let mut pos = 0;
+        while pos < n_frames {
+            let chunk = Ord::min(n_frames - pos, 64);
+            backend.process(chunk, &BufferRef::empty(), &mut out_buf);
+            let l = out_buf.channel_f32(0);
+            let r = out_buf.channel_f32(1);
+            for j in 0..chunk {
+                data[(pos + j) * 2] = l[j];
+                data[(pos + j) * 2 + 1] = r[j];
+            }
+            pos += chunk;
         }
 
         // 空闲检测

@@ -138,7 +138,7 @@ async fn audio_test(
         return Ok(());
     }
 
-    info!("attach sine child to all devices (5s).");
+    info!("attach sine_track to all devices (5s).");
     let mut attached: Vec<(String, aud::TrackId)> = Vec::new();
     for d in &devices {
         info!("resume {}", d.id());
