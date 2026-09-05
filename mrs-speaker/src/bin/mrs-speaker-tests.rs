@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use fundsp::prelude::*;
-use mrs_speaker::aud::{self, AudioManager, SAMPLE_RATE, handler::host_handler, mixer::Mixers};
+use mrs_speaker::aud::{self, AudioManager, Device, SAMPLE_RATE};
 use my_remote_speaker::task::TaskManager;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -107,47 +107,55 @@ async fn audio_test(
     info!("start audio manager.");
     let am = AudioManager::new(tm, ct.clone()).await?;
 
-    // tokio::time::sleep(Duration::from_secs(1)).await;
-    // let devs: Vec<(String, aud::mixer::MixerHandle)> = am
-    //     .list_devices()
-    //     .await?
-    //     .into_iter()
-    //     .filter(|x| match &opts.device {
-    //         Some(sub) => x.id.contains(sub.as_str()),
-    //         None => {
-    //             !(x.id.starts_with("pipewire:output.")
-    //                 || x.id.starts_with("pipewire:output_default")
-    //                 || x.id.starts_with("pipewire:sink_default"))
-    //         }
-    //     })
-    //     .filter_map(|x| mixers.handle(&x.id).map(|d| (x.id, d)))
-    //     .collect();
-    // info!(
-    //     "got {} devices: {:?}",
-    //     devs.len(),
-    //     devs.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>()
-    // );
+    let devices: Vec<Device> = am
+        .devices()
+        .into_iter()
+        .filter(|d| match &opts.device {
+            Some(sub) => d.id().contains(sub.as_str()),
+            None => {
+                !(d.id().starts_with("pipewire:output.")
+                    || d.id().starts_with("pipewire:output_default")
+                    || d.id().starts_with("pipewire:sink_default"))
+            }
+        })
+        .filter(|d| d.state() != aud::DeviceState::Gone)
+        .collect();
+    info!(
+        "got {} devices: {:?}",
+        devices.len(),
+        devices
+            .iter()
+            .map(|d| d.id().to_owned())
+            .collect::<Vec<_>>()
+    );
+    if devices.is_empty() {
+        warn!("no usable device, exit.");
+        return Ok(());
+    }
 
-    // info!("attach sine child to all devices (5s).");
-    // let mut attached = Vec::new();
-    // for (dev_id, mh) in &devs {
-    //     info!("resume {}", dev_id);
-    //     mh.resume()?;
-    //     info!("attach.");
-    //     let id = mh.attach_track(sine_track(440.0, 0.3))?;
-    //     info!("attached. child={:?}", id);
-    //     attached.push(id);
-    // }
-    // tokio::time::sleep(Duration::from_secs(5)).await;
+    info!("attach sine child to all devices (5s).");
+    let mut attached: Vec<(String, aud::TrackId)> = Vec::new();
+    for d in &devices {
+        info!("resume {}", d.id());
+        d.resume()?;
+        info!("attach.");
+        let id = d.attach(sine_track(440.0, opts.amp))?;
+        info!("attached. track={:?}", id);
+        attached.push((d.id().to_owned(), id));
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // info!("detach all.");
-    // for ((dev_id, mh), id) in devs.iter().zip(attached.iter()) {
-    //     info!("detach {}: removed={}", dev_id, mh.detach_track(*id)?);
-    // }
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    warn!("Triggering CancellationToken.");
-    ct.cancel();
-    // h.wait_terminal().await;
+    info!("detach all.");
+    for d in &devices {
+        if let Some((_, track_id)) = attached.iter().find(|(id, _)| id == d.id()) {
+            match d.detach(*track_id) {
+                Ok(_) => {}
+                Err(aud::DeviceError::Gone) => {
+                    warn!("device gone during playback, skip detach.")
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
     Ok(())
 }

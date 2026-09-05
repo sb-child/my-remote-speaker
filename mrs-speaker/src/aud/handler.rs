@@ -1,5 +1,6 @@
 use crate::aud::{
-    SAMPLE_RATE,
+    DEVICE_GRACE, SAMPLE_RATE,
+    devices::{DeviceState, DeviceStates},
     mixer::{DeviceInfo, MixerController, MixerEvent, MixerEventRx, MixerOutput, Mixers},
 };
 use cpal::{
@@ -17,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -31,11 +32,13 @@ fn on_device_add(
     desc: Option<cpal::DeviceDescription>,
     dh: &mut DeviceHandles,
     mixers: &Mixers,
+    states: &DeviceStates,
     tm: &TaskManager,
     ct: CancellationToken,
 ) {
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, desc.as_ref());
+    states.add(dev_info.clone());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
     let h = tm.spawn_blocking_typed(move |_tm, pu, ct| {
         device_handler(&dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
@@ -66,31 +69,51 @@ fn on_device_del(
     mixers.remove(&dev_id_str);
 }
 
-/// 设备任务是否已 settle。
-fn device_settled(s: TypedTaskState<(), (), DeviceHandlerError>) -> bool {
+/// 转换设备任务实时状态到设备目录状态。
+fn device_state_of(s: TypedTaskState<(), (), DeviceHandlerError>) -> DeviceState {
     match s {
-        TypedTaskState::Running(_) => true,
-        TypedTaskState::Failed(f) => matches!(
-            f.as_ref(),
+        // Running: stream 已准备好 -> Ready
+        TypedTaskState::Running(_) => DeviceState::Ready,
+        TypedTaskState::Failed(f) => match f.as_ref() {
+            // Failed: 黑名单类失败 -> Gone
             DeviceHandlerError::DeviceUnsupported
-                | DeviceHandlerError::Stream {
-                    source: StreamHandlerError::FormatUnsupported { .. }
-                }
-                | DeviceHandlerError::Stream {
-                    source: StreamHandlerError::OtherDeviceError { .. }
-                }
-        ),
+            | DeviceHandlerError::Stream {
+                source: StreamHandlerError::FormatUnsupported { .. },
+            }
+            | DeviceHandlerError::Stream {
+                source: StreamHandlerError::OtherDeviceError { .. },
+            } => DeviceState::Gone,
+            // Failed: 会被 audio host 自动重启的失败 -> Initializing
+            _ => DeviceState::Initializing,
+        },
+        // 其它终态 -> Gone
         TypedTaskState::Completed(_)
         | TypedTaskState::Cancelled
         | TypedTaskState::Panicked(_)
-        | TypedTaskState::Invalid => true,
-        TypedTaskState::Pending | TypedTaskState::Cancelling => false,
+        | TypedTaskState::Invalid => DeviceState::Gone,
+        // stream 还没完全准备好 -> Initializing
+        TypedTaskState::Pending | TypedTaskState::Cancelling => DeviceState::Initializing,
     }
 }
 
-/// 所有已 spawn 的设备任务均已 settle。
-fn all_devices_settled(dh: &DeviceHandles) -> bool {
-    dh.values().all(|h| device_settled(h.status()))
+/// 把 device_handles 的实时状态同步进目录。返回是否全部 settle。
+fn sync_device_states(
+    dh: &DeviceHandles,
+    pending: &HashMap<cpal::DeviceId, std::time::Instant>,
+    states: &DeviceStates,
+) -> bool {
+    let mut all_settled = true;
+    for (dev_id, h) in dh {
+        if pending.contains_key(dev_id) {
+            continue;
+        }
+        let next = device_state_of(h.status());
+        states.transition(&dev_id.to_string(), next);
+        if !matches!(next, DeviceState::Ready | DeviceState::Gone) {
+            all_settled = false;
+        }
+    }
+    all_settled
 }
 
 /// - true: set blacklisted
@@ -103,6 +126,7 @@ fn on_device_online(
     description: Option<cpal::DeviceDescription>,
     dh: &mut DeviceHandles,
     mixers: &Mixers,
+    states: &DeviceStates,
     tm: &TaskManager,
     ct: CancellationToken,
 ) -> bool {
@@ -116,6 +140,7 @@ fn on_device_online(
     }
     let dev_id_2 = dev_id.clone();
     let dev_info = DeviceInfo::create(&dev_id_str, description.as_ref());
+    states.add(dev_info.clone());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
     let h = tm.spawn_blocking_typed(move |_tm, pu, ct| {
         device_handler(&dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
@@ -202,16 +227,18 @@ pub fn host_handler(
     pu: ProgressUpdater<()>,
     ct: CancellationToken,
     mixers: Arc<Mixers>,
+    states: DeviceStates,
 ) -> Result<(), HostHandlerError> {
     let audio_host = cpal::default_host();
     enum Action {
         OnDeviceAdd(Option<cpal::DeviceDescription>),
-        OnDeviceDel,
         OnDeviceOnline(bool, Option<cpal::DeviceDescription>),
     }
     let mut device_handles: DeviceHandles = HashMap::new();
     // `value = true` -> blacklisted (device unsupported)
     let mut prev_devices: HashMap<cpal::DeviceId, bool> = HashMap::new();
+    // 从快照消失，等待回收宽限的设备。
+    let mut pending_removals: HashMap<cpal::DeviceId, Instant> = HashMap::new();
     loop {
         let devices_snapshot = match audio_host.output_devices() {
             Ok(d) => d,
@@ -236,13 +263,50 @@ pub fn host_handler(
                 prev_devices.insert(dev_id, false);
             }
         }
+
+        // 设备在限期内复活。
+        pending_removals.retain(|dev_id, _| {
+            if current_devices.contains(dev_id) {
+                let id = dev_id.to_string();
+                info!(dev = %id, "device back within grace, removal cancelled");
+                false
+            } else {
+                true
+            }
+        });
+
+        // 设备消失。
+        let now = Instant::now();
         prev_devices.retain(|dev_id, _| {
             let is_present = current_devices.contains(dev_id);
             if !is_present {
-                actions.insert(dev_id.clone(), Action::OnDeviceDel);
+                pending_removals.entry(dev_id.clone()).or_insert(now);
+                let id = dev_id.to_string();
+                states.transition(&id, DeviceState::Disconnected);
             }
             is_present
         });
+
+        // 消失的设备在限期内没有复活，移除对应的 mixer。
+        let expired: Vec<cpal::DeviceId> = pending_removals
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= DEVICE_GRACE)
+            .map(|(dev_id, _)| dev_id.clone())
+            .collect();
+        for dev_id in expired {
+            pending_removals.remove(&dev_id);
+            let dev_id_str = dev_id.to_string();
+            info!(dev = %dev_id_str, grace = ?DEVICE_GRACE, "device gone beyond grace, removing mixer");
+            on_device_del(
+                dev_id_str.clone(),
+                dev_id,
+                &mut device_handles,
+                &mixers,
+                &tm,
+            );
+            states.remove(&dev_id_str);
+        }
+
         for (dev_id, action) in actions {
             let dev_id_str = dev_id.to_string();
             match action {
@@ -252,12 +316,10 @@ pub fn host_handler(
                     description,
                     &mut device_handles,
                     &mixers,
+                    &states,
                     &tm,
                     ct.child_token(),
                 ),
-                Action::OnDeviceDel => {
-                    on_device_del(dev_id_str, dev_id, &mut device_handles, &mixers, &tm)
-                }
                 Action::OnDeviceOnline(blacklisted, description) => {
                     let should_blacklist_this = on_device_online(
                         dev_id_str,
@@ -266,6 +328,7 @@ pub fn host_handler(
                         description,
                         &mut device_handles,
                         &mixers,
+                        &states,
                         &tm,
                         ct.child_token(),
                     );
@@ -281,7 +344,8 @@ pub fn host_handler(
         } else {
             thread::sleep(Duration::from_secs(1));
         }
-        if all_devices_settled(&device_handles) {
+        // 同步 task 实时状态到设备目录。
+        if sync_device_states(&device_handles, &pending_removals, &states) {
             pu.update(()); // devices are inited
         }
     }
