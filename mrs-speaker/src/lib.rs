@@ -12,6 +12,7 @@ pub mod android_opts;
 pub mod aud;
 pub mod conf;
 pub mod rmt;
+pub mod sche;
 
 #[cfg(feature = "android")]
 #[unsafe(no_mangle)]

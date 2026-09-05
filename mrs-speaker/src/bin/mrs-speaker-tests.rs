@@ -138,7 +138,7 @@ async fn audio_test(
         return Ok(());
     }
 
-    info!("attach sine_track to all devices (5s).");
+    info!("attach sine_track to all devices.");
     let mut attached: Vec<(String, aud::TrackId)> = Vec::new();
     for d in &devices {
         info!("resume {}", d.id());
@@ -148,7 +148,7 @@ async fn audio_test(
         info!("attached. track={:?}", id);
         attached.push((d.id().to_owned(), id));
     }
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     info!("detach all.");
     for d in &devices {

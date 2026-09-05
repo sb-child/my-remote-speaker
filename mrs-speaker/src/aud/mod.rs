@@ -1,7 +1,6 @@
 pub mod devices;
 pub mod handler;
 pub mod mixer;
-pub mod scheduler;
 
 pub use devices::{DeviceEvent, DeviceEventRx, DeviceState};
 pub use mixer::{DeviceInfo, StandbyMode, TrackId};
