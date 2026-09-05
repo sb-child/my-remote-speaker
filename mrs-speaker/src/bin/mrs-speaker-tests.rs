@@ -24,10 +24,10 @@ pub struct Cli {
 /// Audio 子命令选项
 #[derive(clap::Args, Debug, Clone)]
 pub struct AudioOpts {
-    /// 只播放设备 id 包含此子串的设备。过滤虚拟/重复节点。
+    /// 只选取 id 包含此子串的设备。
     #[arg(long)]
     pub device: Option<String>,
-    /// 正弦幅度（默认 0.3）
+    /// 正弦幅度。
     #[arg(long, default_value_t = 0.3)]
     pub amp: f32,
 }
@@ -35,7 +35,7 @@ pub struct AudioOpts {
 /// sub-commands
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// 向设备 attach 5 秒正弦再 detach
+    /// 启动音频模块播放正弦波
     Audio(AudioOpts),
 }
 
