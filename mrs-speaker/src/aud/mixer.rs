@@ -25,7 +25,8 @@ use tracing::{info, warn};
 pub struct Mixers {
     tm: TaskManager,
     ct: CancellationToken,
-    inner: Arc<DashMap<String, MixerBundle>>,
+    _guard: DropGuard,
+    inner: DashMap<String, MixerBundle>,
 }
 
 /// 设备的可读信息
@@ -51,10 +52,12 @@ impl DeviceInfo {
 
 impl Mixers {
     pub fn new(tm: TaskManager, ct: CancellationToken) -> Self {
+        let dg = ct.clone().drop_guard();
         Self {
             tm,
             ct,
-            inner: Arc::new(DashMap::new()),
+            _guard: dg,
+            inner: DashMap::new(),
         }
     }
 
