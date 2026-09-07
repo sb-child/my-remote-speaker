@@ -52,16 +52,22 @@ pub struct AudioManager {
 
 impl AudioManager {
     /// 启动 Audio Host 和 Mixer，等待设备就绪。
-    pub async fn new(tm: TaskManager, ct: CancellationToken) -> Result<Self, AudioManagerError> {
+    pub async fn new(tm: &TaskManager, ct: CancellationToken) -> Result<Self, AudioManagerError> {
         let mixers = Arc::new(Mixers::new(tm.clone(), ct.clone()));
         let states = DeviceStates::new();
         let mixers_for_host_handler = mixers.clone();
         let states_for_host_handler = states.clone();
         let host_handle = tm.spawn_blocking_typed(move |tm, pu, ct| {
-            host_handler(tm, pu, ct, mixers_for_host_handler, states_for_host_handler)?;
+            host_handler(
+                &tm,
+                pu,
+                ct,
+                mixers_for_host_handler,
+                states_for_host_handler,
+            )?;
             Ok::<(), HostHandlerError>(())
         });
-        host_handle.cancel_at(&ct);
+        host_handle.cancel_at(ct.clone());
         ensure_host_is_running(&host_handle).await?;
         Ok(Self {
             _guard: ct.drop_guard().into(),
@@ -88,10 +94,10 @@ impl AudioManager {
     }
 
     /// 按 id 取设备视图。
-    pub fn device(&self, id: &str) -> Option<Device> {
-        let handle = self.mixers.handle(id)?;
-        self.states.get(id)?;
-        Some(Device::new(id.to_owned(), handle, self.states.clone()))
+    pub fn device(&self, id: Arc<str>) -> Option<Device> {
+        let handle = self.mixers.handle(&id)?;
+        self.states.get(&id)?;
+        Some(Device::new(id, handle, self.states.clone()))
     }
 
     /// 订阅设备生命周期事件。
@@ -107,13 +113,13 @@ impl AudioManager {
 /// 设备视图。
 #[derive(Clone)]
 pub struct Device {
-    id: String,
+    id: Arc<str>,
     handle: MixerHandle,
     states: DeviceStates,
 }
 
 impl Device {
-    fn new(id: String, handle: MixerHandle, states: DeviceStates) -> Self {
+    fn new(id: Arc<str>, handle: MixerHandle, states: DeviceStates) -> Self {
         Self { id, handle, states }
     }
 
@@ -206,5 +212,5 @@ pub enum AudioManagerError {
     #[snafu(display("Audio host quit unexpectedly."))]
     HostHandlerQuited,
     #[snafu(display("Audio host panicked with message: {}", msg))]
-    HostHandlerPanicked { msg: Arc<String> },
+    HostHandlerPanicked { msg: Arc<str> },
 }

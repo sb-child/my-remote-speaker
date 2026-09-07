@@ -25,9 +25,13 @@ use tracing::{debug, error, info, instrument, warn};
 
 type DeviceHandles = HashMap<cpal::DeviceId, TaskHandle<(), (), DeviceHandlerError>>;
 
-#[instrument(skip_all, fields(device = dev_id_str))]
+fn get_id(x: &cpal::DeviceId) -> Arc<str> {
+    x.id().into()
+}
+
+#[instrument(skip_all, fields(dev = &*dev_id_str))]
 fn on_device_add(
-    dev_id_str: String,
+    dev_id_str: Arc<str>,
     dev_id: cpal::DeviceId,
     desc: Option<cpal::DeviceDescription>,
     dh: &mut DeviceHandles,
@@ -37,13 +41,13 @@ fn on_device_add(
     ct: CancellationToken,
 ) {
     let dev_id_2 = dev_id.clone();
-    let dev_info = DeviceInfo::create(&dev_id_str, desc.as_ref());
+    let dev_info = DeviceInfo::create(dev_id_str.clone(), desc.as_ref());
     states.add(dev_info.clone());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
     let h = tm.spawn_blocking_typed(move |_tm, pu, ct| {
-        device_handler(&dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
+        device_handler(dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
     });
-    h.cancel_at(&ct);
+    h.cancel_at(ct);
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task started. Cancelling old task.");
         old_task.cancel(); // maybe unreachable
@@ -52,9 +56,9 @@ fn on_device_add(
     };
 }
 
-#[instrument(skip_all, fields(device = dev_id_str))]
+#[instrument(skip_all, fields(dev = &*dev_id_str))]
 fn on_device_del(
-    dev_id_str: String,
+    dev_id_str: Arc<str>,
     dev_id: cpal::DeviceId,
     dh: &mut DeviceHandles,
     mixers: &Mixers,
@@ -108,7 +112,7 @@ fn sync_device_states(
             continue;
         }
         let next = device_state_of(h.status());
-        states.transition(&dev_id.to_string(), next);
+        states.transition(get_id(dev_id), next);
         if !matches!(next, DeviceState::Ready | DeviceState::Gone) {
             all_settled = false;
         }
@@ -118,9 +122,9 @@ fn sync_device_states(
 
 /// - true: set blacklisted
 /// - false: no action required
-#[instrument(skip_all, fields(device = dev_id_str, blacklisted = blacklisted))]
+#[instrument(skip_all, fields(dev = &*dev_id_str, blacklisted = blacklisted))]
 fn on_device_online(
-    dev_id_str: String,
+    dev_id_str: Arc<str>,
     dev_id: cpal::DeviceId,
     blacklisted: bool,
     description: Option<cpal::DeviceDescription>,
@@ -139,13 +143,13 @@ fn on_device_online(
         }
     }
     let dev_id_2 = dev_id.clone();
-    let dev_info = DeviceInfo::create(&dev_id_str, description.as_ref());
+    let dev_info = DeviceInfo::create(dev_id_str.clone(), description.as_ref());
     states.add(dev_info.clone());
     let (_handle, mixer_ctrl, mixer_out) = mixers.get_or_create(&dev_info);
     let h = tm.spawn_blocking_typed(move |_tm, pu, ct| {
-        device_handler(&dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
+        device_handler(dev_id_str, &dev_id_2, mixer_ctrl, mixer_out, pu, ct)
     });
-    h.cancel_at(&ct);
+    h.cancel_at(ct);
     if let Some(old_task) = dh.insert(dev_id, h) {
         warn!("Task restarted. Cancelling old task.");
         old_task.cancel(); // maybe unreachable
@@ -158,9 +162,9 @@ fn on_device_online(
 /// - Some(true): device unsupported
 /// - Some(false): device disconnected
 /// - None: no action required
-#[instrument(skip_all, fields(device = dev_id_str))]
+#[instrument(skip_all, fields(dev = &*dev_id_str))]
 fn get_device_status(
-    dev_id_str: String,
+    dev_id_str: Arc<str>,
     status: TypedTaskState<(), (), DeviceHandlerError>,
 ) -> Option<bool> {
     match status {
@@ -223,7 +227,7 @@ pub enum HostHandlerError {
 }
 
 pub fn host_handler(
-    tm: TaskManager,
+    tm: &TaskManager,
     pu: ProgressUpdater<()>,
     ct: CancellationToken,
     mixers: Arc<Mixers>,
@@ -267,8 +271,8 @@ pub fn host_handler(
         // 设备在限期内复活。
         pending_removals.retain(|dev_id, _| {
             if current_devices.contains(dev_id) {
-                let id = dev_id.to_string();
-                info!(dev = %id, "device back within grace, removal cancelled");
+                let dev_id_str = dev_id.id();
+                info!(dev = %dev_id_str, "device back within grace, removal cancelled");
                 false
             } else {
                 true
@@ -281,8 +285,7 @@ pub fn host_handler(
             let is_present = current_devices.contains(dev_id);
             if !is_present {
                 pending_removals.entry(dev_id.clone()).or_insert(now);
-                let id = dev_id.to_string();
-                states.transition(&id, DeviceState::Disconnected);
+                states.transition(get_id(dev_id), DeviceState::Disconnected);
             }
             is_present
         });
@@ -295,20 +298,14 @@ pub fn host_handler(
             .collect();
         for dev_id in expired {
             pending_removals.remove(&dev_id);
-            let dev_id_str = dev_id.to_string();
+            let dev_id_str = get_id(&dev_id);
             info!(dev = %dev_id_str, grace = ?DEVICE_GRACE, "device gone beyond grace, removing mixer");
-            on_device_del(
-                dev_id_str.clone(),
-                dev_id,
-                &mut device_handles,
-                &mixers,
-                &tm,
-            );
-            states.remove(&dev_id_str);
+            on_device_del(dev_id_str.clone(), dev_id, &mut device_handles, &mixers, tm);
+            states.remove(dev_id_str);
         }
 
         for (dev_id, action) in actions {
-            let dev_id_str = dev_id.to_string();
+            let dev_id_str = get_id(&dev_id);
             match action {
                 Action::OnDeviceAdd(description) => on_device_add(
                     dev_id_str,
@@ -317,7 +314,7 @@ pub fn host_handler(
                     &mut device_handles,
                     &mixers,
                     &states,
-                    &tm,
+                    tm,
                     ct.child_token(),
                 ),
                 Action::OnDeviceOnline(blacklisted, description) => {
@@ -329,7 +326,7 @@ pub fn host_handler(
                         &mut device_handles,
                         &mixers,
                         &states,
-                        &tm,
+                        tm,
                         ct.child_token(),
                     );
                     if should_blacklist_this {
@@ -351,9 +348,9 @@ pub fn host_handler(
     }
 }
 
-#[instrument(skip_all, fields(device = _dev_id))]
+#[instrument(skip_all, fields(dev = &*dev_id_str))]
 fn device_handler(
-    _dev_id: &str,
+    dev_id_str: Arc<str>,
     dev_id: &cpal::DeviceId,
     mixer_ctrl: MixerController,
     mixer_out: MixerOutput,
@@ -403,7 +400,7 @@ fn device_handler(
     };
     let device_wait_timeout = Duration::from_secs(1);
     stream_handler(
-        &dev_id.to_string(),
+        dev_id_str,
         device,
         stream_config,
         device_wait_timeout,
@@ -418,9 +415,9 @@ fn device_handler(
     Ok(())
 }
 
-#[instrument(skip_all, fields(device = dev_id, supp_2ch = support_2ch, supp_f32 = support_f32))]
+#[instrument(skip_all, fields(device = &*dev_id_str, supp_2ch = support_2ch, supp_f32 = support_f32))]
 fn stream_handler(
-    dev_id: &str,
+    dev_id_str: Arc<str>,
     device: cpal::Device,
     stream_config: StreamConfig,
     device_wait_timeout: Duration,
@@ -442,7 +439,7 @@ fn stream_handler(
         }
         info!("Building output stream...");
         mixer_ctrl.reset();
-        let dev_id_string = dev_id.to_string();
+        let dev_id_str_for_err_cb = dev_id_str.clone();
         let mc_for_err_cb = mixer_ctrl.clone();
         let mut mo_for_stream_cb = mixer_out.clone();
         let restart_tx_cb = restart_tx.clone();
@@ -459,7 +456,9 @@ fn stream_handler(
                         &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(&dev_id_string, e, &mc_for_err_cb, &restart_tx_cb),
+                move |e| {
+                    stream_error_callback(&dev_id_str_for_err_cb, e, &mc_for_err_cb, &restart_tx_cb)
+                },
                 Some(device_wait_timeout),
             )
         } else {
@@ -474,7 +473,9 @@ fn stream_handler(
                         &mut mo_for_stream_cb,
                     );
                 },
-                move |e| stream_error_callback(&dev_id_string, e, &mc_for_err_cb, &restart_tx_cb),
+                move |e| {
+                    stream_error_callback(&dev_id_str_for_err_cb, e, &mc_for_err_cb, &restart_tx_cb)
+                },
                 Some(device_wait_timeout),
             )
         };

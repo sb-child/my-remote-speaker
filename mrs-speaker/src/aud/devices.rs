@@ -31,11 +31,11 @@ pub enum DeviceEvent {
     /// 设备首次出现。
     Added { info: DeviceInfo },
     /// stream 准备好。
-    Ready { id: String },
+    Ready { id: Arc<str> },
     /// 设备从快照消失。
-    Disconnected { id: String },
+    Disconnected { id: Arc<str> },
     /// 设备超时已回收，或设备在黑名单。
-    Gone { id: String },
+    Gone { id: Arc<str> },
 }
 
 pub type DeviceEventTx = MTx<mpmc::Array<DeviceEvent>>;
@@ -44,7 +44,7 @@ pub type DeviceEventRx = MRx<mpmc::Array<DeviceEvent>>;
 /// 设备目录。
 #[derive(Clone)]
 pub struct DeviceStates {
-    inner: Arc<DashMap<String, DeviceEntry>>,
+    inner: Arc<DashMap<Arc<str>, DeviceEntry>>,
     events_tx: DeviceEventTx,
     events_rx: DeviceEventRx,
 }
@@ -70,7 +70,7 @@ impl DeviceStates {
 
     /// 当前设备目录快照。
     /// - id -> entry。
-    pub fn snapshot(&self) -> Vec<(String, DeviceEntry)> {
+    pub fn snapshot(&self) -> Vec<(Arc<str>, DeviceEntry)> {
         self.inner
             .iter()
             .map(|e| (e.key().clone(), e.value().clone()))
@@ -80,7 +80,7 @@ impl DeviceStates {
     /// 记录设备出现事件。
     pub(crate) fn add(&self, info: DeviceInfo) {
         if self.inner.contains_key(&info.id) {
-            self.transition(&info.id, DeviceState::Initializing);
+            self.transition(info.id, DeviceState::Initializing);
             return;
         }
         self.inner.insert(
@@ -95,9 +95,9 @@ impl DeviceStates {
     }
 
     /// 状态迁移，返回是否发生变化。
-    pub(crate) fn transition(&self, id: &str, next: DeviceState) -> bool {
+    pub(crate) fn transition(&self, id: Arc<str>, next: DeviceState) -> bool {
         let mut changed = false;
-        if let Some(mut e) = self.inner.get_mut(id) {
+        if let Some(mut e) = self.inner.get_mut(&id) {
             if e.state != next {
                 e.state = next;
                 e.disconnected_at = if next == DeviceState::Disconnected {
@@ -111,20 +111,18 @@ impl DeviceStates {
         if changed {
             match next {
                 DeviceState::Initializing => {}
-                DeviceState::Ready => self.send(DeviceEvent::Ready { id: id.to_owned() }),
-                DeviceState::Disconnected => {
-                    self.send(DeviceEvent::Disconnected { id: id.to_owned() })
-                }
-                DeviceState::Gone => self.send(DeviceEvent::Gone { id: id.to_owned() }),
+                DeviceState::Ready => self.send(DeviceEvent::Ready { id: id }),
+                DeviceState::Disconnected => self.send(DeviceEvent::Disconnected { id: id }),
+                DeviceState::Gone => self.send(DeviceEvent::Gone { id: id }),
             }
         }
         changed
     }
 
     /// 移除设备，广播 Gone。
-    pub(crate) fn remove(&self, id: &str) {
-        if self.inner.remove(id).is_some() {
-            self.send(DeviceEvent::Gone { id: id.to_owned() });
+    pub(crate) fn remove(&self, id: Arc<str>) {
+        if self.inner.remove(&id).is_some() {
+            self.send(DeviceEvent::Gone { id: id });
         }
     }
 

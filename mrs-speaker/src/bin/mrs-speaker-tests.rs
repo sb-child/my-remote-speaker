@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|e| format!("{}", e))
         });
-        h.cancel_at(&ct);
+        h.cancel_at(ct);
         tokio::select! {
             _r = tokio::signal::ctrl_c() => { error!("ctrl-c trigged."); }
             _r = h.wait_terminal() => {}
@@ -87,7 +87,7 @@ async fn app(
     ct: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t = match command {
-        Commands::Audio(_) => audio_test(opts, tm.clone(), ct.child_token()),
+        Commands::Audio(_) => audio_test(opts, &tm, ct.child_token()),
     };
     t.await
 }
@@ -105,7 +105,7 @@ fn sine_track(freq: f32, amp: f32) -> Box<dyn AudioUnit> {
 
 async fn audio_test(
     opts: AudioOpts,
-    tm: TaskManager,
+    tm: &TaskManager,
     ct: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _g = ct.drop_guard_ref();

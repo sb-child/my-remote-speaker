@@ -26,26 +26,26 @@ pub struct Mixers {
     tm: TaskManager,
     ct: CancellationToken,
     _guard: DropGuard,
-    inner: DashMap<String, MixerBundle>,
+    inner: DashMap<Arc<str>, MixerBundle>,
 }
 
 /// 设备的可读信息
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     /// 设备 id
-    pub id: String,
+    pub id: Arc<str>,
     /// 设备名
-    pub name: String,
+    pub name: Arc<str>,
     /// 物理地址/连接标识
-    pub address: Option<String>,
+    pub address: Option<Arc<str>>,
 }
 
 impl DeviceInfo {
-    pub fn create(dev_id_str: &str, desc: Option<&cpal::DeviceDescription>) -> Self {
+    pub fn create(dev_id_str: Arc<str>, desc: Option<&cpal::DeviceDescription>) -> Self {
         Self {
-            id: dev_id_str.to_owned(),
-            name: desc.map(|d| d.name().to_owned()).unwrap_or_default(),
-            address: desc.and_then(|d| d.address().map(str::to_owned)),
+            id: dev_id_str,
+            name: desc.map(|d| d.name().into()).unwrap_or_default(),
+            address: desc.and_then(|d| d.address().map(|x| x.into())),
         }
     }
 }
@@ -92,14 +92,14 @@ impl Mixers {
     }
 
     /// 移除指定设备的 Mixer。
-    pub(crate) fn remove(&self, dev_id: &str) {
+    pub(crate) fn remove(&self, dev_id: &Arc<str>) {
         if self.inner.remove(dev_id).is_some() {
             info!(dev = %dev_id, "mixer removed");
         }
     }
 
     /// 获取指定设备的 MixerHandle。
-    pub fn handle(&self, dev_id: &str) -> Option<MixerHandle> {
+    pub fn handle(&self, dev_id: &Arc<str>) -> Option<MixerHandle> {
         self.inner.get(dev_id).map(|b| b.handle.clone())
     }
 
@@ -288,7 +288,7 @@ impl Mixer {
             events_tx,
             state.clone(),
             backend_tx,
-            &mixer_ct,
+            mixer_ct.clone(),
         );
         let ct_guard = mixer_ct.drop_guard();
         // 等 worker 建好 network backend。
@@ -321,7 +321,7 @@ fn spawn_mixer_worker(
     events_tx: MixerEventTx,
     state: Arc<MixerLinkState>,
     backend_tx: OneshotTx<NetBackend>,
-    ct: &CancellationToken,
+    ct: CancellationToken,
 ) -> TaskHandle<(), (), ()> {
     let h = tm.spawn_blocking_typed(move |_tm, pc, ct| {
         pc.update(());
@@ -720,7 +720,7 @@ mod tests {
         let tm = TaskManager::new();
         let ct = CancellationToken::new();
         let mixers = Mixers::new(tm, ct);
-        let (handle, ctrl, out) = mixers.get_or_create(&DeviceInfo::create(dev, None));
+        let (handle, ctrl, out) = mixers.get_or_create(&DeviceInfo::create(dev.into(), None));
         (mixers, handle, ctrl, out)
     }
 
