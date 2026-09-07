@@ -112,7 +112,7 @@ fn sync_device_states(
             continue;
         }
         let next = device_state_of(h.status());
-        states.transition(get_id(dev_id), next);
+        states.transition_ref(dev_id.id(), next);
         if !matches!(next, DeviceState::Ready | DeviceState::Gone) {
             all_settled = false;
         }
@@ -285,7 +285,7 @@ pub fn host_handler(
             let is_present = current_devices.contains(dev_id);
             if !is_present {
                 pending_removals.entry(dev_id.clone()).or_insert(now);
-                states.transition(get_id(dev_id), DeviceState::Disconnected);
+                states.transition_ref(dev_id.id(), DeviceState::Disconnected);
             }
             is_present
         });

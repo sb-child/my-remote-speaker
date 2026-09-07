@@ -80,7 +80,7 @@ impl DeviceStates {
     /// 记录设备出现事件。
     pub(crate) fn add(&self, info: DeviceInfo) {
         if self.inner.contains_key(&info.id) {
-            self.transition(info.id, DeviceState::Initializing);
+            self.transition_arc(info.id, DeviceState::Initializing);
             return;
         }
         self.inner.insert(
@@ -95,7 +95,33 @@ impl DeviceStates {
     }
 
     /// 状态迁移，返回是否发生变化。
-    pub(crate) fn transition(&self, id: Arc<str>, next: DeviceState) -> bool {
+    pub(crate) fn transition_ref(&self, id: &str, next: DeviceState) -> bool {
+        let mut changed = false;
+        if let Some(mut e) = self.inner.get_mut(id) {
+            if e.state != next {
+                e.state = next;
+                e.disconnected_at = if next == DeviceState::Disconnected {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                changed = true;
+            }
+        }
+        if changed {
+            let arc_id = id.into();
+            match next {
+                DeviceState::Initializing => {}
+                DeviceState::Ready => self.send(DeviceEvent::Ready { id: arc_id }),
+                DeviceState::Disconnected => self.send(DeviceEvent::Disconnected { id: arc_id }),
+                DeviceState::Gone => self.send(DeviceEvent::Gone { id: arc_id }),
+            }
+        }
+        changed
+    }
+
+    /// 状态迁移，返回是否发生变化。
+    pub(crate) fn transition_arc(&self, id: Arc<str>, next: DeviceState) -> bool {
         let mut changed = false;
         if let Some(mut e) = self.inner.get_mut(&id) {
             if e.state != next {
@@ -111,9 +137,9 @@ impl DeviceStates {
         if changed {
             match next {
                 DeviceState::Initializing => {}
-                DeviceState::Ready => self.send(DeviceEvent::Ready { id: id }),
-                DeviceState::Disconnected => self.send(DeviceEvent::Disconnected { id: id }),
-                DeviceState::Gone => self.send(DeviceEvent::Gone { id: id }),
+                DeviceState::Ready => self.send(DeviceEvent::Ready { id }),
+                DeviceState::Disconnected => self.send(DeviceEvent::Disconnected { id }),
+                DeviceState::Gone => self.send(DeviceEvent::Gone { id }),
             }
         }
         changed
@@ -122,7 +148,7 @@ impl DeviceStates {
     /// 移除设备，广播 Gone。
     pub(crate) fn remove(&self, id: Arc<str>) {
         if self.inner.remove(&id).is_some() {
-            self.send(DeviceEvent::Gone { id: id });
+            self.send(DeviceEvent::Gone { id });
         }
     }
 
