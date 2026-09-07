@@ -116,7 +116,7 @@ async fn audio_test(
         .devices()
         .into_iter()
         .filter(|d| match &opts.device {
-            Some(sub) => d.id().contains(sub.as_str()),
+            Some(sub) => d.id().starts_with(sub.as_str()),
             None => {
                 !(d.id().starts_with("output.")
                     || d.id().starts_with("output_default")
