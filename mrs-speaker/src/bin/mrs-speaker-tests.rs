@@ -118,9 +118,9 @@ async fn audio_test(
         .filter(|d| match &opts.device {
             Some(sub) => d.id().contains(sub.as_str()),
             None => {
-                !(d.id().starts_with("pipewire:output.")
-                    || d.id().starts_with("pipewire:output_default")
-                    || d.id().starts_with("pipewire:sink_default"))
+                !(d.id().starts_with("output.")
+                    || d.id().starts_with("output_default")
+                    || d.id().starts_with("sink_default"))
             }
         })
         .filter(|d| d.state() != aud::DeviceState::Gone)
